@@ -516,6 +516,25 @@ def startup_health_check():
     except Exception as ex:
         print("[ERROR] Could not connect to KuCoin ticker endpoint:", ex)
         return False
+    print("\n[Startup] Checking IP whitelisting for Binance...")
+    try:
+        my_ip = session.get("https://api.ipify.org").text
+        print(f"Current public IP: {my_ip}")
+        print("Please ensure this IP is whitelisted in your Binance API key settings.")
+    except:
+        print("[WARNING] Could not fetch public IP.")
+    print("Verifying whitelisting by making a signed request...")
+    try:
+        account = binance_request("GET", "/fapi/v2/account")
+        if isinstance(account, dict) and 'code' in account and account['code'] < 0:
+            print("[ERROR] Binance signed request failed:", account.get('msg', 'Unknown error'))
+            print("If this is due to IP restriction, whitelist the IP and restart.")
+            return False
+        print("[OK] Binance signed request successful. IP is whitelisted.")
+    except Exception as ex:
+        print("[ERROR] Binance signed request error:", str(ex))
+        print("Likely IP not whitelisted or other auth issue. Please check and restart.")
+        return False
     print("[Startup] All API connectivity checks PASSED.\n")
     return True
 # -------------------- MAIN LOOP --------------------
@@ -525,17 +544,6 @@ def main():
     if not startup_health_check():
         print("[Fatal] Startup health check failed. Please check your API credentials, exchange access, and server network, then restart.")
         sys.exit(1)
-    # Fetch and display public IP for Binance IP whitelisting
-    try:
-        ip_response = session.get('http://ipecho.net/plain', timeout=5)
-        ip = ip_response.text.strip()
-        print(f"\n[INFO] Current public IP address: {ip}")
-        print(f"[INFO] Please whitelist this IP in your Binance API settings: https://www.binance.com/en/my/settings/api-management")
-        print(f"[INFO] After whitelisting, the bot will proceed automatically. If IP changes (e.g., on Railway restart), re-whitelist and restart.\n")
-    except Exception as ex:
-        print(f"\n[WARNING] Could not fetch public IP: {ex}")
-        print("[WARNING] Please manually determine your public IP (e.g., via whatismyip.com) and whitelist it in Binance API settings.")
-        print("[WARNING] Bot will proceed, but Binance requests may fail until whitelisted.\n")
     symbols, ku_map = get_common_symbols()
     if not symbols:
         print("No common symbols found. Exiting.")
