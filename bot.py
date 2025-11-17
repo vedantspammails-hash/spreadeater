@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # bot.py - Full production-ready Binance + KuCoin Futures Arbitrage Bot
-# NOW WITH: Automatic Railway IP detection + blocks trading until Binance IP is whitelisted
+# FIXED: Better error handling for IP whitelist test (no more JSON parse crashes)
 
 import time, hmac, hashlib, json, requests, base64, math, sys
 from urllib.parse import urlencode
@@ -57,7 +57,7 @@ def calc_slippage(expected, filled):
     if expected == 0: return 0.0
     return (filled - expected) / expected * 100.0
 
-# ==================== IP WHITELIST GATE (RAILWAY SAFE) ====================
+# ==================== IP WHITELIST GATE (RAILWAY SAFE - FIXED JSON HANDLING) ====================
 def get_public_ip():
     for url in ["https://api.ipify.org", "https://ifconfig.me", "https://icanhazip.com"]:
         try:
@@ -69,6 +69,9 @@ def get_public_ip():
     return None
 
 def binance_test_authenticated():
+    if not BINANCE_API_KEY or not BINANCE_API_SECRET or 'YOUR' in BINANCE_API_KEY:
+        return False, "ERROR: BINANCE_API_KEY or BINANCE_API_SECRET missing/invalid in Railway env vars. Set them now!"
+    
     params = {'timestamp': int(time.time() * 1000), 'recvWindow': 5000}
     query = urlencode(params)
     signature = hmac.new(BINANCE_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
@@ -77,18 +80,29 @@ def binance_test_authenticated():
     try:
         r = session.get(f"{BINANCE_BASE}/fapi/v1/account", params=params, headers=headers, timeout=10)
         if r.status_code == 200:
+            # Valid JSON means success
+            r.json()
             return True, "IP WHITELISTED & API KEY VALID"
         else:
-            data = r.json()
-            code, msg = data.get("code"), data.get("msg", "")
-            if code == -2015:
-                return False, "Invalid API key/secret OR IP not whitelisted"
-            elif "IP" in msg.lower() or "banned" in msg.lower():
-                return False, f"IP NOT WHITELISTED: {msg}"
-            else:
-                return False, f"Binance error {code}: {msg}"
-    except Exception as e:
+            # Handle non-JSON errors (e.g., 401 text response)
+            try:
+                data = r.json()
+                code, msg = data.get("code"), data.get("msg", "")
+                if code == -2015:
+                    return False, f"Invalid API key/secret (code -2015): {msg}. Recreate key with Futures permission."
+                elif code == -1021:
+                    return False, f"IP NOT WHITELISTED (code -1021): {msg}. Wait 15min or re-add IP {get_public_ip()}."
+                else:
+                    return False, f"Binance error {code}: {msg}"
+            except json.JSONDecodeError:
+                # Raw text response (common for 401)
+                return False, f"HTTP {r.status_code}: {r.text.strip()}. Likely IP/key issue - recreate key & wait 15min."
+    except requests.exceptions.Timeout:
+        return False, "Timeout connecting to Binance. Check Railway network."
+    except requests.exceptions.RequestException as e:
         return False, f"Connection failed: {e}"
+    except Exception as e:
+        return False, f"Unexpected error: {e}"
 
 def wait_for_binance_ip_whitelist():
     print("\n" + "="*70)
@@ -100,10 +114,11 @@ def wait_for_binance_ip_whitelist():
         sys.exit(1)
     print(f"Your server IP → \033[1;33m{ip}\033[0m")
     print(f"→ Go to: https://www.binance.com/en/my/settings/api-management")
-    print(f"→ Edit your API key → Add this IP: \033[1;33m{ip}\033[0m")
+    print(f"→ Edit/Create API key → Add this IP: \033[1;33m{ip}\033[0m")
     print(f"→ Enable 'Futures' trading permission")
     print("Bot will wait until you whitelist this IP...\n")
 
+    debug_once = True  # Print raw response only once to avoid spam
     while True:
         ok, msg = binance_test_authenticated()
         if ok:
@@ -112,6 +127,14 @@ def wait_for_binance_ip_whitelist():
             time.sleep(2)
             return
         else:
+            if debug_once:
+                # Quick test public endpoint to confirm connectivity
+                try:
+                    public_r = session.get(BINANCE_INFO_URL, timeout=5)
+                    print(f"[DEBUG] Public API works (status {public_r.status_code}). Issue is auth-only.")
+                except:
+                    print("[DEBUG] Even public API failing - check Railway internet/proxy.")
+                debug_once = False
             print(f"[{ts_str()}] Waiting for whitelist... {msg}")
         time.sleep(3)
 
@@ -155,7 +178,7 @@ def binance_get_position_amt(symbol):
 def fetch_binance_funding_events(symbol):
     try:
         r = session.get(BINANCE_FUNDING_URL.format(symbol=symbol), timeout=8)
-        data = r.json()
+        data = safe_json(r)  # Use safe_json to avoid crashes
         events = [(int(d["fundingTime"])/1000.0, float(d["fundingRate"])) for d in data]
         return events
     except:
@@ -164,13 +187,20 @@ def fetch_binance_funding_events(symbol):
 def get_binance_symbol_precision_map():
     out = {}
     try:
-        r = session.get(BINANCE_INFO_URL, timeout=10).json()
-        for s in r.get("symbols", []):
+        r = session.get(BINANCE_INFO_URL, timeout=10)
+        data = safe_json(r)
+        for s in data.get("symbols", []):
             if s.get("contractType") == "PERPETUAL":
                 out[s["symbol"]] = int(s.get("quantityPrecision", 8))
     except:
         pass
     return out
+
+def safe_json(r):
+    try:
+        return r.json() if r.text.strip() else {}
+    except:
+        return {}
 
 # -------------------- KUCOIN HELPERS --------------------
 def kucoin_sign(method, endpoint, body=None):
@@ -217,15 +247,16 @@ def kucoin_get_position_qty(symbol):
             "KC-API-PASSPHRASE": passph, "KC-API-KEY-VERSION": "2", "Content-Type": "application/json"
         }
         r = session.get(KUCOIN_BASE + f"/api/v1/position/single?symbol={symbol}", headers=headers, timeout=8)
-        return float(r.json().get("data", {}).get("currentQty", 0))
+        return float(safe_json(r).get("data", {}).get("currentQty", 0))
     except:
         return 0.0
 
 def fetch_kucoin_funding_events(symbol):
     try:
         r = session.get(KUCOIN_FUNDING_URL.format(symbol=symbol + "M"), timeout=8)
+        data = safe_json(r).get("data", [])
         events = []
-        for d in r.json().get("data", []):
+        for d in data:
             ft = float(d.get("fundingTime") or d.get("time") or 0) / 1000.0
             fr = float(d.get("fundingRate", 0))
             events.append((ft, fr))
@@ -236,8 +267,9 @@ def fetch_kucoin_funding_events(symbol):
 def get_kucoin_contract_precisions():
     out = {}
     try:
-        r = session.get(KUCOIN_ACTIVE_URL, timeout=10).json()
-        for c in r.get("data", []):
+        r = session.get(KUCOIN_ACTIVE_URL, timeout=10)
+        data = safe_json(r)
+        for c in data.get("data", []):
             sym = c["symbol"]
             if sym.endswith("M"):
                 prec = c.get("baseIncrementPrecision", 3)
@@ -249,9 +281,13 @@ def get_kucoin_contract_precisions():
 # -------------------- MARKET DATA --------------------
 def get_common_symbols():
     try:
-        bin_symbols = [s["symbol"] for s in session.get(BINANCE_INFO_URL, timeout=10).json().get("symbols", []) 
+        r_bin = session.get(BINANCE_INFO_URL, timeout=10)
+        bin_data = safe_json(r_bin)
+        bin_symbols = [s["symbol"] for s in bin_data.get("symbols", []) 
                       if s.get("contractType") == "PERPETUAL" and s.get("status") == "TRADING"]
-        ku_symbols = [c["symbol"] for c in session.get(KUCOIN_ACTIVE_URL, timeout=10).json().get("data", [])]
+        r_ku = session.get(KUCOIN_ACTIVE_URL, timeout=10)
+        ku_data = safe_json(r_ku)
+        ku_symbols = [c["symbol"] for c in ku_data.get("data", [])]
         ku_map = {s[:-1]: s for s in ku_symbols if s.endswith("M")}
         common = [s for s in bin_symbols if s in ku_map]
         return common, ku_map
@@ -262,7 +298,9 @@ def get_common_symbols():
 def get_prices(symbols, ku_map):
     bin_book = {}
     try:
-        for d in session.get(BINANCE_BOOK_URL, timeout=10).json():
+        r = session.get(BINANCE_BOOK_URL, timeout=10)
+        data = safe_json(r)
+        for d in data:
             bin_book[d["symbol"]] = {"bid": float(d["bidPrice"]), "ask": float(d["askPrice"])}
     except: pass
 
@@ -271,7 +309,8 @@ def get_prices(symbols, ku_map):
         futures = {ex.submit(session.get, KUCOIN_TICKER_URL.format(symbol=ku_map[s]), timeout=5): s for s in symbols}
         for f in as_completed(futures):
             try:
-                j = f.result().json().get("data", {})
+                r = f.result()
+                j = safe_json(r).get("data", {})
                 sym = ku_map[futures[f]]
                 ku_prices[sym] = {"bid": float(j.get("bestBidPrice") or 0), "ask": float(j.get("bestAskPrice") or 0)}
             except: pass
@@ -335,18 +374,22 @@ def compute_funding_impact(open_ts, close_ts, long_ex, short_ex, symbol):
             for ft, fr in fetch_binance_funding_events(symbol):
                 if open_ts < ft <= close_ts:
                     total -= fr * TRADE_SIZE
+                    events.append(("Binance_long", ft, fr, -fr * TRADE_SIZE))
         if short_ex == "Binance":
             for ft, fr in fetch_binance_funding_events(symbol):
                 if open_ts < ft <= close_ts:
                     total += fr * TRADE_SIZE
+                    events.append(("Binance_short", ft, fr, fr * TRADE_SIZE))
         if long_ex == "KuCoin":
             for ft, fr in fetch_kucoin_funding_events(symbol):
                 if open_ts < ft <= close_ts:
                     total -= fr * TRADE_SIZE
+                    events.append(("KuCoin_long", ft, fr, -fr * TRADE_SIZE))
         if short_ex == "KuCoin":
             for ft, fr in fetch_kucoin_funding_events(symbol):
                 if open_ts < ft <= close_ts:
                     total += fr * TRADE_SIZE
+                    events.append(("KuCoin_short", ft, fr, fr * TRADE_SIZE))
     except: pass
     return total, events
 
@@ -363,66 +406,109 @@ class Position:
         self.opened_diff = float(opened_diff)
         self.open_time = time.time()
         self.closed = False
+        self.slippage_long_pct = 0.0
+        self.slippage_short_pct = 0.0
+        self.fill_price_long = 0.0
+        self.fill_price_short = 0.0
 
+        # -------------------- EXACT NOTIONAL MATCH LOGIC --------------------
         bin_prec = bin_prec_map.get(symbol, 6)
         ku_prec = ku_prec_map.get(self.short_symbol_ku, 3)
-        qty_bin = floor_to_precision(TRADE_SIZE / self.long_price, bin_prec)
-        qty_ku = floor_to_precision(TRADE_SIZE / self.short_price, ku_prec)
-        notional_bin = qty_bin * self.long_price
-        notional_ku = qty_ku * self.short_price
-        final_notional = min(notional_bin, notional_ku)
-        self.qty_long = floor_to_precision(final_notional / self.long_price, bin_prec)
-        self.qty_short = floor_to_precision(final_notional / self.short_price, ku_prec)
-
-        print(f"[{ts_str()}] OPEN {symbol} {direction} spread={opened_diff:.4f}% long={long_ex} short={short_ex} notional≈${final_notional:.2f}")
-
+        qty_bin0 = floor_to_precision(TRADE_SIZE / self.long_price, bin_prec)
+        qty_ku0 = floor_to_precision(TRADE_SIZE / self.short_price, ku_prec)
+        not_bin = qty_bin0 * self.long_price
+        not_ku = qty_ku0 * self.short_price
+        qty_bin = qty_bin0
+        qty_ku = qty_ku0
+        while abs(not_bin - not_ku) > 0.01 and qty_bin > 0 and qty_ku > 0:
+            if not_bin > not_ku:
+                qty_bin -= 10 ** -bin_prec
+                qty_bin = floor_to_precision(qty_bin, bin_prec)
+                not_bin = qty_bin * self.long_price
+            else:
+                qty_ku -= 10 ** -ku_prec
+                qty_ku = floor_to_precision(qty_ku, ku_prec)
+                not_ku = qty_ku * self.short_price
+        final_notional = min(not_bin, not_ku)
+        qty_bin = floor_to_precision(final_notional / self.long_price, bin_prec)
+        qty_ku = floor_to_precision(final_notional / self.short_price, ku_prec)
+        not_bin = qty_bin * self.long_price
+        not_ku = qty_ku * self.short_price
+        if qty_bin <= 0 or qty_ku <= 0 or abs(not_bin - not_ku) > 0.01:
+            raise ValueError(f"Could not produce exactly matched notional for {symbol}: qty_bin={qty_bin}, not_bin={not_bin}, qty_ku={qty_ku}, not_ku={not_ku}")
+        self.qty_long = qty_bin if long_ex == "Binance" else qty_ku
+        self.qty_short = qty_ku if short_ex == "KuCoin" else qty_bin
+        print(f"[{ts_str()}] OPEN {symbol} dir={direction} opened_diff={opened_diff:.4f}% long_ex={long_ex} short_ex={short_ex}")
+        print(f" target notional ${TRADE_SIZE:.2f}; final notional long={self.qty_long*self.long_price:.6f}, short={self.qty_short*self.short_price:.6f}")
         try:
             if direction == "+ve":
-                bin_order = binance_place_market(symbol, "BUY", self.qty_long)
-                bin_filled = wait_order_binance(symbol, bin_order["orderId"])
-                self.fill_long = extract_fill_price_binance(bin_filled or bin_order)
-                ku_order = kucoin_place_market(self.short_symbol_ku, "sell", self.qty_short)
-                ku_filled = wait_order_kucoin(ku_order["data"]["orderId"]) if ku_order.get("data", {}).get("orderId") else None
-                self.fill_short = extract_fill_price_kucoin(ku_filled or ku_order)
+                order_bin = binance_place_market(self.symbol, "BUY", self.qty_long)
+                order_bin_filled = wait_order_binance(self.symbol, order_bin.get("orderId"))
+                self.fill_price_long = extract_fill_price_binance(order_bin_filled or order_bin)
+                order_ku = kucoin_place_market(self.short_symbol_ku, "sell", self.qty_short)
+                order_ku_id = (order_ku.get("data") or {}).get("orderId")
+                order_ku_filled = wait_order_kucoin(order_ku_id) if order_ku_id else None
+                self.fill_price_short = extract_fill_price_kucoin(order_ku_filled or order_ku)
             else:
-                ku_order = kucoin_place_market(self.short_symbol_ku, "buy", self.qty_long)
-                ku_filled = wait_order_kucoin(ku_order["data"]["orderId"]) if ku_order.get("data", {}).get("orderId") else None
-                self.fill_long = extract_fill_price_kucoin(ku_filled or ku_order)
-                bin_order = binance_place_market(symbol, "SELL", self.qty_short)
-                bin_filled = wait_order_binance(symbol, bin_order["orderId"])
-                self.fill_short = extract_fill_price_binance(bin_filled or bin_order)
+                order_ku = kucoin_place_market(self.short_symbol_ku, "buy", self.qty_long)
+                order_ku_id = (order_ku.get("data") or {}).get("orderId")
+                order_ku_filled = wait_order_kucoin(order_ku_id) if order_ku_id else None
+                self.fill_price_long = extract_fill_price_kucoin(order_ku_filled or order_ku)
+                order_bin = binance_place_market(self.symbol, "SELL", self.qty_short)
+                order_bin_filled = wait_order_binance(self.symbol, order_bin.get("orderId"))
+                self.fill_price_short = extract_fill_price_binance(order_bin_filled or order_bin)
         except Exception as e:
-            print("[FATAL] Order failed:", e)
+            print("[ERROR] order placement:", e)
             raise
-
-        self.slip_long = calc_slippage(self.long_price, self.fill_long) * 100
-        self.slip_short = calc_slippage(self.short_price, self.fill_short) * 100
-        print(f"Filled long@{self.fill_long:.6f} (exp {self.long_price:.6f}) slip={self.slip_long:+.4f}%")
-        print(f"Filled short@{self.fill_short:.6f} (exp {self.short_price:.6f}) slip={self.slip_short:+.4f}%")
+        self.slippage_long_pct = calc_slippage(self.long_price, self.fill_price_long) * 100.0 if self.fill_price_long else 0.0
+        self.slippage_short_pct = calc_slippage(self.short_price, self.fill_price_short) * 100.0 if self.fill_price_short else 0.0
+        print(f"[{ts_str()}] Filled long at {self.fill_price_long:.8f} (expected {self.long_price:.8f}), slippage {self.slippage_long_pct:.6f}%")
+        print(f"[{ts_str()}] Filled short at {self.fill_price_short:.8f} (expected {self.short_price:.8f}), slippage {self.slippage_short_pct:.6f}%")
 
     def check_liquidation(self):
-        b = abs(binance_get_position_amt(self.symbol)) < 1e-6
-        k = abs(kucoin_get_position_qty(self.short_symbol_ku)) < 1e-6
-        return b or k
+        try:
+            b_amt = binance_get_position_amt(self.symbol)
+        except:
+            b_amt = 0.0
+        try:
+            k_amt = kucoin_get_position_qty(self.short_symbol_ku)
+        except:
+            k_amt = 0.0
+        return abs(b_amt) < 1e-6 or abs(k_amt) < 1e-6
 
     def close(self, close_price_long, close_price_short, close_diff):
-        if self.closed: return
+        if self.closed:
+            return None
         self.close_time = time.time()
-        spread_gain = self.opened_diff - close_diff if self.direction == "+ve" else -(self.opened_diff + close_diff)
-        gross = spread_gain / 100 * TRADE_SIZE * LEVERAGE
-        fees = 2 * TRADE_SIZE * (FEE_BINANCE if self.long_ex == "Binance" else FEE_KUCOIN) + \
-               2 * TRADE_SIZE * (FEE_BINANCE if self.short_ex == "Binance" else FEE_KUCOIN)
-        funding, _ = compute_funding_impact(self.open_time, self.close_time, self.long_ex, self.short_ex, self.symbol)
-        net = gross - fees + funding
+        spread_gain = (self.opened_diff - close_diff) if self.direction == "+ve" else - (self.opened_diff + close_diff)
+        exposure = TRADE_SIZE
+        gross_pnl = spread_gain / 100.0 * exposure * LEVERAGE
+        fee_long_rate = FEE_BINANCE if self.long_ex == "Binance" else FEE_KUCOIN
+        fee_short_rate = FEE_BINANCE if self.short_ex == "Binance" else FEE_KUCOIN
+        fee_long_total = 2 * exposure * fee_long_rate
+        fee_short_total = 2 * exposure * fee_short_rate
+        total_fees = fee_long_total + fee_short_total
+        funding_total, funding_events = compute_funding_impact(self.open_time, self.close_time, self.long_ex, self.short_ex, self.symbol)
+        net_pnl = gross_pnl - total_fees + funding_total
         self.closed = True
-
-        print("\n" + "="*50)
-        print("TRADE CLOSED")
-        print(f"Symbol: {self.symbol} | Direction: {self.direction}")
-        print(f"Open spread: {self.opened_diff:.4f}% → Close spread: {close_diff:.4f}% → Captured: {spread_gain:.4f}%")
-        print(f"Gross PnL: ${gross:+.4f} | Fees: ${fees:.4f} | Funding: ${funding:+.4f} → Net: ${net:+.4f}")
-        print("="*50 + "\n")
-
+        print("\n=== TRADE CLOSED ===")
+        print(f"Symbol: {self.symbol}")
+        print(f"Open time: {ts_str(self.open_time)}, Close time: {ts_str(self.close_time)}")
+        print(f"Direction: {'Long Binance / Short KuCoin' if self.direction=='+ve' else 'Long KuCoin / Short Binance'}")
+        print(f"Opened spread: {self.opened_diff:.6f}%, Close spread: {close_diff:.6f}% => Spread captured: {spread_gain:.6f}%")
+        print(f"Exposure (per leg): ${exposure:.2f}, Leverage: {LEVERAGE}x => Gross PnL: {gross_pnl:.8f}")
+        print(f"Trading fees (both legs open+close): {total_fees:.8f} (long total {fee_long_total:.8f}, short total {fee_short_total:.8f})")
+        if funding_events:
+            print("Applied funding events:")
+            for ev in funding_events:
+                sname, ft, fr, impact = ev
+                print(f" - {sname} @ {ts_str(ft)} rate={fr:+.8f} impact=${impact:+.8f}")
+        else:
+            print("Applied funding events: None")
+        print(f"Funding net: {funding_total:+.8f}")
+        print(f"Slippage long %: {self.slippage_long_pct:.8f}, slippage short %: {self.slippage_short_pct:.8f}")
+        print(f"Net PnL: {net_pnl:+.8f}")
+        print("====================\n")
         try:
             if self.direction == "+ve":
                 binance_place_market(self.symbol, "SELL", self.qty_long)
@@ -430,18 +516,26 @@ class Position:
             else:
                 kucoin_place_market(self.short_symbol_ku, "sell", self.qty_long)
                 binance_place_market(self.symbol, "BUY", self.qty_short)
-        except: pass
-
-        return net
+        except Exception:
+            pass
+        return net_pnl
 
 # -------------------- HEALTH CHECK --------------------
 def startup_health_check():
     print("\n[Startup] Running connectivity checks...")
     try:
-        session.get(BINANCE_INFO_URL, timeout=10).raise_for_status()
-        print("Binance public API: OK")
-        session.get(KUCOIN_ACTIVE_URL, timeout=10).raise_for_status()
-        print("KuCoin public API: OK")
+        r = session.get(BINANCE_INFO_URL, timeout=10)
+        if r.status_code == 200:
+            print("Binance public API: OK")
+        else:
+            print(f"Binance public API: FAIL (status {r.status_code})")
+            return False
+        r = session.get(KUCOIN_ACTIVE_URL, timeout=10)
+        if r.status_code == 200:
+            print("KuCoin public API: OK")
+        else:
+            print(f"KuCoin public API: FAIL (status {r.status_code})")
+            return False
         print("All checks passed!\n")
         return True
     except Exception as e:
@@ -450,75 +544,90 @@ def startup_health_check():
 
 # -------------------- MAIN --------------------
 def main():
-    print("Starting Binance + KuCoin Futures Arbitrage Bot - Live Mode")
+    print("Starting live arbitrage bot (production-ready) -", ts_str())
+    # Health check
     if not startup_health_check():
+        print("[Fatal] Startup health check failed. Please check your API credentials, exchange access, and server network, then restart.")
         sys.exit(1)
-
     symbols, ku_map = get_common_symbols()
     if not symbols:
-        print("No common perpetual symbols found!")
+        print("No common symbols found. Exiting.")
         return
-    print(f"Monitoring {len(symbols)} symbols")
-
+    print(f"Found {len(symbols)} common symbols")
     bin_prec_map = get_binance_symbol_precision_map()
     ku_prec_map = get_kucoin_contract_precisions()
     open_pos = None
-
     try:
         while True:
-            bin_book, ku_prices = get_prices(symbols, ku_map)
-
-            if open_pos:
-                b = bin_book.get(open_pos.symbol)
-                k = ku_prices.get(open_pos.short_symbol_ku)
-                if not b or not k:
+            try:
+                bin_book, ku_prices = get_prices(symbols, ku_map)
+                if open_pos:
+                    b = bin_book.get(open_pos.symbol)
+                    k = ku_prices.get(open_pos.short_symbol_ku)
+                    if not b or not k:
+                        time.sleep(POLL_INTERVAL)
+                        continue
+                    diff_entry = calc_diff(b["bid"], b["ask"], k["bid"], k["ask"])
+                    close_diff = ((k["bid"] - b["ask"]) / b["ask"] * 100.0) if open_pos.direction == "+ve" else ((k["ask"] - b["bid"]) / b["bid"] * 100.0)
+                    exit_zero = (open_pos.direction == "+ve" and (diff_entry is None or diff_entry <= 0)) or (open_pos.direction == "-ve" and (diff_entry is None or diff_entry >= 0))
+                    profit_hit = False
+                    if open_pos.direction == "+ve" and diff_entry is not None and diff_entry <= (open_pos.opened_diff - PROFIT_TARGET):
+                        profit_hit = True
+                    if open_pos.direction == "-ve" and diff_entry is not None and diff_entry >= (open_pos.opened_diff + PROFIT_TARGET):
+                        profit_hit = True
+                    try:
+                        liq_flag = open_pos.check_liquidation()
+                    except:
+                        liq_flag = False
+                    if exit_zero or profit_hit or liq_flag:
+                        print(f"[{ts_str()}] Closing position: exit_zero={exit_zero}, profit_hit={profit_hit}, liquidation={liq_flag}")
+                        open_pos.close(b["bid"], k["ask"], close_diff)
+                        open_pos = None
+                        time.sleep(1.0)
+                        continue
                     time.sleep(POLL_INTERVAL)
                     continue
-
-                current_diff = (k["bid"] - b["ask"]) / b["ask"] * 100 if open_pos.direction == "+ve" else (k["ask"] - b["bid"]) / b["bid"] * 100
-                zero_cross = (open_pos.direction == "+ve" and current_diff <= 0) or (open_pos.direction == "-ve" and current_diff >= 0)
-                profit_hit = (open_pos.direction == "+ve" and current_diff <= open_pos.opened_diff - PROFIT_TARGET) or \
-                             (open_pos.direction == "-ve" and current_diff >= open_pos.opened_diff + PROFIT_TARGET)
-
-                if zero_cross or profit_hit or open_pos.check_liquidation():
-                    open_pos.close(b["bid"], k["ask"], current_diff)
-                    open_pos = None
-                    time.sleep(1)
+                best_sym = None
+                best_diff = 0.0
+                best_pair = None
+                for s in symbols:
+                    b = bin_book.get(s)
+                    k = ku_prices.get(ku_map[s])
+                    if not b or not k:
+                        continue
+                    diff = calc_diff(b["bid"], b["ask"], k["bid"], k["ask"])
+                    if diff is None:
+                        continue
+                    if abs(diff) > abs(best_diff):
+                        best_diff = diff
+                        best_sym = s
+                        best_pair = (b, k)
+                if best_sym and abs(best_diff) >= TRADE_TRIGGER:
+                    b, k = best_pair
+                    if best_diff > 0:
+                        long_ex = "Binance"
+                        short_ex = "KuCoin"
+                        long_price = b["ask"]
+                        short_price = k["bid"]
+                    else:
+                        long_ex = "KuCoin"
+                        short_ex = "Binance"
+                        long_price = k["ask"]
+                        short_price = b["bid"]
+                    try:
+                        open_pos = Position(best_sym, long_ex, short_ex, long_price, short_price, "+ve" if best_diff > 0 else "-ve", best_diff, bin_prec_map, ku_prec_map, ku_map)
+                    except Exception as e:
+                        print("[ERROR] could not open position:", e)
+                        open_pos = None
+                        time.sleep(1.0)
+                        continue
                 else:
                     time.sleep(POLL_INTERVAL)
-                continue
-
-            best_diff = 0
-            best_sym = None
-            best_pair = None
-            for s in symbols:
-                b = bin_book.get(s)
-                k = ku_prices.get(ku_map[s])
-                if not b or not k: continue
-                diff = calc_diff(b["bid"], b["ask"], k["bid"], k["ask"])
-                if diff and abs(diff) > abs(best_diff):
-                    best_diff = diff
-                    best_sym = s
-                    best_pair = (b, k)
-
-            if best_sym and abs(best_diff) >= TRADE_TRIGGER:
-                b, k = best_pair
-                long_ex = "Binance" if best_diff > 0 else "KuCoin"
-                short_ex = "KuCoin" if best_diff > 0 else "Binance"
-                long_price = b["ask"] if best_diff > 0 else k["ask"]
-                short_price = k["bid"] if best_diff > 0 else b["bid"]
-                try:
-                    open_pos = Position(best_sym, long_ex, short_ex, long_price, short_price,
-                                        "+ve" if best_diff > 0 else "-ve", best_diff,
-                                        bin_prec_map, ku_prec_map, ku_map)
-                except Exception as e:
-                    print("Failed to open position:", e)
-                    open_pos = None
-            else:
-                time.sleep(POLL_INTERVAL)
-
+            except Exception as e:
+                print("[MAIN LOOP ERROR]", e)
+                time.sleep(2.0)
     except KeyboardInterrupt:
-        print("\nBot stopped by user")
+        print("Stopping by user")
 
 if __name__ == "__main__":
     main()
