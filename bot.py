@@ -66,26 +66,6 @@ def floor_to_precision(qty, precision):
 def calc_slippage(expected, filled):
     if expected == 0: return 0.0
     return (filled - expected) / expected * 100.0
-
-# -------------------- PUBLIC IP HELPER (ADDED) --------------------
-def get_public_ip():
-    """
-    Fetch the public IP of the server so you can whitelist it in Binance's API IP whitelist.
-    Uses a simple external service (ipify). If it fails, returns None.
-    """
-    try:
-        # plain text endpoint is simplest and widely supported
-        r = requests.get("https://api.ipify.org?format=text", timeout=6)
-        if r.status_code == 200:
-            ip = r.text.strip()
-            # basic validation
-            parts = ip.split(".")
-            if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
-                return ip
-        return None
-    except Exception:
-        return None
-
 # -------------------- BINANCE HELPERS --------------------
 def binance_sign(params):
     query = urlencode(params)
@@ -541,27 +521,21 @@ def startup_health_check():
 # -------------------- MAIN LOOP --------------------
 def main():
     print("Starting live arbitrage bot (production-ready) -", ts_str())
-
-    # --- Added: print server public IP and wait for user to confirm whitelisting ---
-    ip = get_public_ip()
-    if ip:
-        print(f"\n[Important] Detected public IP: {ip}")
-        print("[Important] Please add this IP to your Binance API key IP whitelist (if you use IP whitelisting).")
-        print("Once you've added the IP in Binance, press Enter to continue and let the bot run.")
-        try:
-            input("Press Enter to continue after whitelisting (or Ctrl+C to abort)...")
-        except KeyboardInterrupt:
-            print("\nAborted by user before whitelisting. Exiting.")
-            sys.exit(1)
-    else:
-        print("\n[Warning] Could not determine public IP automatically. If you use Binance IP whitelisting, please determine your server's public IP and add it manually.")
-        print("Proceeding without pause. If you want to stop and whitelist, press Ctrl+C now.")
-        # do not block; proceed
-
     # Health check
     if not startup_health_check():
         print("[Fatal] Startup health check failed. Please check your API credentials, exchange access, and server network, then restart.")
         sys.exit(1)
+    # Fetch and display public IP for Binance IP whitelisting
+    try:
+        ip_response = session.get('http://ipecho.net/plain', timeout=5)
+        ip = ip_response.text.strip()
+        print(f"\n[INFO] Current public IP address: {ip}")
+        print(f"[INFO] Please whitelist this IP in your Binance API settings: https://www.binance.com/en/my/settings/api-management")
+        print(f"[INFO] After whitelisting, the bot will proceed automatically. If IP changes (e.g., on Railway restart), re-whitelist and restart.\n")
+    except Exception as ex:
+        print(f"\n[WARNING] Could not fetch public IP: {ex}")
+        print("[WARNING] Please manually determine your public IP (e.g., via whatismyip.com) and whitelist it in Binance API settings.")
+        print("[WARNING] Bot will proceed, but Binance requests may fail until whitelisted.\n")
     symbols, ku_map = get_common_symbols()
     if not symbols:
         print("No common symbols found. Exiting.")
