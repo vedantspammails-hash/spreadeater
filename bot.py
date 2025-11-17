@@ -25,14 +25,14 @@ KUCOIN_API_PASSPHRASE = os.environ.get("KUCOIN_API_PASSPHRASE", "YOUR_KUCOIN_API
 SCAN_THRESHOLD = 0.25
 TRADE_TRIGGER = 1.5   # ENTRY THRESHOLD is ±1.5%
 PROFIT_TARGET = 0.60
-TRADE_SIZE = 80.0  # $80 notional per leg (not margin)
+TRADE_SIZE = 80.0 # $80 notional per leg (not margin)
 LEVERAGE = 3.0
 FEE_BINANCE = 0.0004
 FEE_KUCOIN = 0.0006
-POLL_INTERVAL = 0.8  # main loop sleep
+POLL_INTERVAL = 0.8 # main loop sleep
 MAX_WORKERS = 8
 ORDER_POLL_INTERVAL = 0.2
-ORDER_POLL_TIMEOUT = 10.0  # seconds to wait for fill
+ORDER_POLL_TIMEOUT = 10.0 # seconds to wait for fill
 
 # -------------------- ENDPOINTS --------------------
 BINANCE_BASE = "https://fapi.binance.com"
@@ -40,7 +40,7 @@ KUCOIN_BASE = "https://api-futures.kucoin.com"
 BINANCE_INFO_URL = f"{BINANCE_BASE}/fapi/v1/exchangeInfo"
 BINANCE_BOOK_URL = f"{BINANCE_BASE}/fapi/v1/ticker/bookTicker"
 BINANCE_ORDER_URL = f"{BINANCE_BASE}/fapi/v1/order"
-BINANCE_ORDER_STATUS = f"{BINANCE_BASE}/fapi/v1/order"  # GET with symbol+orderId
+BINANCE_ORDER_STATUS = f"{BINANCE_BASE}/fapi/v1/order" # GET with symbol+orderId
 BINANCE_POSITION_URL = f"{BINANCE_BASE}/fapi/v2/positionRisk"
 BINANCE_FUNDING_URL = f"{BINANCE_BASE}/fapi/v1/fundingRate?symbol={{symbol}}&limit=100"
 KUCOIN_ACTIVE_URL = f"{KUCOIN_BASE}/api/v1/contracts/active"
@@ -50,40 +50,35 @@ KUCOIN_ORDER_STATUS = f"{KUCOIN_BASE}/api/v1/orders/{{orderId}}"
 KUCOIN_POSITION_URL = f"{KUCOIN_BASE}/api/v1/position/single?symbol={{symbol}}"
 KUCOIN_FUNDING_URL = f"{KUCOIN_BASE}/api/v1/funding-rate/history?symbol={{symbol}}&pageSize=50"
 
+BINANCE_IP_WHITELIST_URL = f"{BINANCE_BASE}/sapi/v1/account/apiRestrictions/ipRestriction/ipList"
+
 # -------------------- SESSIONS --------------------
 session = requests.Session()
 session.headers.update({"User-Agent": "LiveArbBot/1.0"})
 
-# -------------------- UTILITIES --------------------
+# -------------------- UTIL --------------------
 def now_ts():
     return int(time.time())
-
 def ts_str(ts=None):
     return datetime.fromtimestamp(ts or time.time()).strftime("%Y-%m-%d %H:%M:%S")
-
 def safe_json(r):
     try:
         return r.json()
     except:
         return {}
-
 def floor_to_precision(qty, precision):
     if precision < 0: precision = 0
     factor = 10 ** precision
     return math.floor(qty * factor) / factor
-
 def calc_slippage(expected, filled):
-    if expected == 0:
-        return 0.0
+    if expected == 0: return 0.0
     return (filled - expected) / expected * 100.0
 
 # -------------------- BINANCE HELPERS --------------------
-
 def binance_sign(params):
     query = urlencode(params)
     sig = hmac.new(BINANCE_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
     return sig
-
 def binance_request(method, endpoint, params=None):
     params = params or {}
     params['timestamp'] = int(time.time() * 1000)
@@ -95,15 +90,12 @@ def binance_request(method, endpoint, params=None):
     r = session.request(method, url, headers=headers, params=params, timeout=10)
     r.raise_for_status()
     return r.json()
-
 def binance_place_market(symbol, side, quantity):
     params = {"symbol": symbol, "side": side, "type": "MARKET", "quantity": str(quantity)}
     return binance_request("POST", "/fapi/v1/order", params)
-
 def binance_get_order(symbol, orderId):
     params = {"symbol": symbol, "orderId": orderId}
     return binance_request("GET", "/fapi/v1/order", params)
-
 def binance_get_position_amt(symbol):
     r = binance_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
     if isinstance(r, list):
@@ -111,7 +103,6 @@ def binance_get_position_amt(symbol):
             if p.get("symbol") == symbol:
                 return float(p.get("positionAmt", 0))
     return 0.0
-
 def fetch_binance_funding_events(symbol):
     try:
         r = session.get(BINANCE_FUNDING_URL.format(symbol=symbol), timeout=8)
@@ -124,7 +115,6 @@ def fetch_binance_funding_events(symbol):
         return events
     except:
         return []
-
 def get_binance_symbol_precision_map():
     out = {}
     try:
@@ -137,16 +127,49 @@ def get_binance_symbol_precision_map():
         pass
     return out
 
-# -------------------- KUCOIN HELPERS --------------------
+# --- New code for IP whitelist checking ---
+def get_public_ip():
+    try:
+        r = requests.get("https://api.ipify.org?format=json", timeout=10)
+        r.raise_for_status()
+        ip = r.json().get("ip", None)
+        if not ip:
+            raise ValueError("No IP found in response")
+        return ip
+    except Exception as e:
+        print(f"[ERROR] Could not fetch public IP: {e}")
+        return None
 
+def check_binance_ip_whitelist(ip):
+    try:
+        params = {
+            "timestamp": int(time.time() * 1000),
+            "recvWindow": 5000
+        }
+        sig = binance_sign(params)
+        params["signature"] = sig
+        headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
+        url = BINANCE_IP_WHITELIST_URL
+        r = session.get(url, headers=headers, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        ip_list = data.get("ipList", [])
+        for entry in ip_list:
+            if entry.get("ip") == ip:
+                return True
+        return False
+    except Exception as e:
+        print(f"[ERROR] Could not check Binance IP whitelist: {e}")
+        return False
+
+# -------------------- KUCOIN HELPERS --------------------
 def kucoin_sign(method, endpoint, body=None):
-    now = str(int(time.time() * 1000))
+    now = str(int(time.time()*1000))
     body_str = json.dumps(body) if body else ""
     str_to_sign = now + method.upper() + endpoint + body_str
     signature = base64.b64encode(hmac.new(KUCOIN_API_SECRET.encode(), str_to_sign.encode(), hashlib.sha256).digest()).decode()
     passphrase = base64.b64encode(hmac.new(KUCOIN_API_SECRET.encode(), KUCOIN_API_PASSPHRASE.encode(), hashlib.sha256).digest()).decode()
     return now, signature, passphrase
-
 def kucoin_request(method, endpoint, body=None, params=None):
     now, sig, passph = kucoin_sign(method, endpoint, body)
     headers = {
@@ -164,22 +187,19 @@ def kucoin_request(method, endpoint, body=None, params=None):
         r = session.post(url, headers=headers, json=body, timeout=10)
     r.raise_for_status()
     return r.json()
-
 def kucoin_place_market(symbol, side, size):
     endpoint = "/api/v1/orders"
     body = {
-        "clientOid": str(int(time.time() * 1000000)),
+        "clientOid": str(int(time.time()*1000000)),
         "symbol": symbol,
         "side": side.lower(),
         "type": "market",
         "size": str(size)
     }
     return kucoin_request("POST", endpoint, body=body)
-
 def kucoin_get_order(order_id):
     endpoint = f"/api/v1/orders/{order_id}"
     return kucoin_request("GET", endpoint)
-
 def kucoin_get_position_qty(symbol):
     try:
         endpoint = f"/api/v1/position/single?symbol={symbol}"
@@ -197,7 +217,6 @@ def kucoin_get_position_qty(symbol):
         return float(data.get("currentQty", 0) or 0)
     except:
         return 0.0
-
 def fetch_kucoin_funding_events(symbol):
     try:
         r = session.get(KUCOIN_FUNDING_URL.format(symbol=symbol), timeout=8)
@@ -210,7 +229,6 @@ def fetch_kucoin_funding_events(symbol):
         return events
     except:
         return []
-
 def get_kucoin_contract_precisions():
     out = {}
     try:
@@ -226,7 +244,6 @@ def get_kucoin_contract_precisions():
     return out
 
 # -------------------- MARKET DATA --------------------
-
 def get_common_symbols():
     try:
         bin_symbols = [s["symbol"] for s in session.get(BINANCE_INFO_URL, timeout=10).json().get("symbols", []) if s.get("contractType") == "PERPETUAL" and s.get("status") == "TRADING"]
@@ -241,7 +258,6 @@ def get_common_symbols():
     except Exception as e:
         print("get_common_symbols error:", e)
         return [], {}
-
 def get_prices(symbols, ku_map):
     bin_book = {}
     try:
@@ -262,7 +278,6 @@ def get_prices(symbols, ku_map):
             except:
                 pass
     return bin_book, ku_prices
-
 def calc_diff(bin_bid, bin_ask, ku_bid, ku_ask):
     if not bin_bid or not bin_ask or not ku_bid or not ku_ask:
         return None
@@ -275,7 +290,6 @@ def calc_diff(bin_bid, bin_ask, ku_bid, ku_ask):
     return None
 
 # -------------------- ORDER UTILITIES --------------------
-
 def wait_order_binance(symbol, orderId, timeout=ORDER_POLL_TIMEOUT):
     start = time.time()
     while time.time() - start < timeout:
@@ -288,7 +302,6 @@ def wait_order_binance(symbol, orderId, timeout=ORDER_POLL_TIMEOUT):
             pass
         time.sleep(ORDER_POLL_INTERVAL)
     return None
-
 def wait_order_kucoin(orderId, timeout=ORDER_POLL_TIMEOUT):
     start = time.time()
     while time.time() - start < timeout:
@@ -301,7 +314,6 @@ def wait_order_kucoin(orderId, timeout=ORDER_POLL_TIMEOUT):
             pass
         time.sleep(ORDER_POLL_INTERVAL)
     return None
-
 def extract_fill_price_binance(order):
     fills = order.get("fills") or []
     if not fills:
@@ -314,8 +326,7 @@ def extract_fill_price_binance(order):
         q = float(f.get("qty", 0))
         num += p * q
         den += q
-    return (num / den) if den else 0.0
-
+    return (num/den) if den else 0.0
 def extract_fill_price_kucoin(order_resp):
     data = order_resp.get("data") or {}
     if data.get("filledAvgPrice"):
@@ -326,7 +337,6 @@ def extract_fill_price_kucoin(order_resp):
     return float(data.get("dealFunds") or 0) / float(data.get("filledSize") or 1) if data.get("filledSize") else 0.0
 
 # -------------------- FUNDING CALC --------------------
-
 def compute_funding_impact(position_open_ts, position_close_ts, long_ex_name, short_ex_name, symbol):
     total = 0.0
     applied = []
@@ -372,10 +382,8 @@ def compute_funding_impact(position_open_ts, position_close_ts, long_ex_name, sh
     return total, applied
 
 # -------------------- POSITION CLASS --------------------
-
 class Position:
-    def __init__(self, symbol, long_ex, short_ex, long_price, short_price, direction, opened_diff,
-                 bin_prec_map, ku_prec_map, ku_map):
+    def __init__(self, symbol, long_ex, short_ex, long_price, short_price, direction, opened_diff, bin_prec_map, ku_prec_map, ku_map):
         self.symbol = symbol
         self.short_symbol_ku = ku_map.get(symbol)
         self.long_ex = long_ex
@@ -392,6 +400,7 @@ class Position:
         self.fill_price_long = 0.0
         self.fill_price_short = 0.0
 
+        # -------------------- EXACT NOTIONAL MATCH LOGIC --------------------
         bin_prec = bin_prec_map.get(symbol, 6)
         ku_prec = ku_prec_map.get(self.short_symbol_ku, 3)
 
@@ -421,16 +430,13 @@ class Position:
         not_ku = qty_ku * self.short_price
 
         if qty_bin <= 0 or qty_ku <= 0 or abs(not_bin - not_ku) > 0.01:
-            raise ValueError(
-                f"Could not produce exactly matched notional for {symbol}: qty_bin={qty_bin}, not_bin={not_bin}, qty_ku={qty_ku}, not_ku={not_ku}")
+            raise ValueError(f"Could not produce exactly matched notional for {symbol}: qty_bin={qty_bin}, not_bin={not_bin}, qty_ku={qty_ku}, not_ku={not_ku}")
 
         self.qty_long = qty_bin if long_ex == "Binance" else qty_ku
         self.qty_short = qty_ku if short_ex == "KuCoin" else qty_bin
 
-        print(
-            f"[{ts_str()}] OPEN {symbol} dir={direction} opened_diff={opened_diff:.4f}% long_ex={long_ex} short_ex={short_ex}")
-        print(
-            f" target notional ${TRADE_SIZE:.2f}; final notional long={self.qty_long * self.long_price:.6f}, short={self.qty_short * self.short_price:.6f}")
+        print(f"[{ts_str()}] OPEN {symbol} dir={direction} opened_diff={opened_diff:.4f}% long_ex={long_ex} short_ex={short_ex}")
+        print(f" target notional ${TRADE_SIZE:.2f}; final notional long={self.qty_long*self.long_price:.6f}, short={self.qty_short*self.short_price:.6f}")
 
         try:
             if direction == "+ve":
@@ -458,10 +464,8 @@ class Position:
             raise
         self.slippage_long_pct = calc_slippage(self.long_price, self.fill_price_long) * 100.0 if self.fill_price_long else 0.0
         self.slippage_short_pct = calc_slippage(self.short_price, self.fill_price_short) * 100.0 if self.fill_price_short else 0.0
-        print(
-            f"[{ts_str()}] Filled long at {self.fill_price_long:.8f} (expected {self.long_price:.8f}), slippage {self.slippage_long_pct:.6f}%")
-        print(
-            f"[{ts_str()}] Filled short at {self.fill_price_short:.8f} (expected {self.short_price:.8f}), slippage {self.slippage_short_pct:.6f}")
+        print(f"[{ts_str()}] Filled long at {self.fill_price_long:.8f} (expected {self.long_price:.8f}), slippage {self.slippage_long_pct:.6f}%")
+        print(f"[{ts_str()}] Filled short at {self.fill_price_short:.8f} (expected {self.short_price:.8f}), slippage {self.slippage_short_pct:.6f}")
 
     def check_liquidation(self):
         try:
@@ -475,7 +479,6 @@ class Position:
         if abs(b_amt) < 1e-6 or abs(k_amt) < 1e-6:
             return True
         return False
-
     def close(self, close_price_long, close_price_short, close_diff):
         if self.closed:
             return None
@@ -488,20 +491,16 @@ class Position:
         fee_long_total = 2 * exposure * fee_long_rate
         fee_short_total = 2 * exposure * fee_short_rate
         total_fees = fee_long_total + fee_short_total
-        funding_total, funding_events = compute_funding_impact(self.open_time, self.close_time, self.long_ex, self.short_ex,
-                                                              self.symbol)
+        funding_total, funding_events = compute_funding_impact(self.open_time, self.close_time, self.long_ex, self.short_ex, self.symbol)
         net_pnl = gross_pnl - total_fees + funding_total
         self.closed = True
         print("\n=== TRADE CLOSED ===")
         print(f"Symbol: {self.symbol}")
         print(f"Open time: {ts_str(self.open_time)}, Close time: {ts_str(self.close_time)}")
-        print(
-            f"Direction: {'Long Binance / Short KuCoin' if self.direction == '+ve' else 'Long KuCoin / Short Binance'}")
-        print(
-            f"Opened spread: {self.opened_diff:.6f}%, Close spread: {close_diff:.6f}% => Spread captured: {spread_gain:.6f}%")
+        print(f"Direction: {'Long Binance / Short KuCoin' if self.direction=='+ve' else 'Long KuCoin / Short Binance'}")
+        print(f"Opened spread: {self.opened_diff:.6f}%, Close spread: {close_diff:.6f}% => Spread captured: {spread_gain:.6f}%")
         print(f"Exposure (per leg): ${exposure:.2f}, Leverage: {LEVERAGE}x => Gross PnL: {gross_pnl:.8f}")
-        print(
-            f"Trading fees (both legs open+close): {total_fees:.8f} (long total {fee_long_total:.8f}, short total {fee_short_total:.8f})")
+        print(f"Trading fees (both legs open+close): {total_fees:.8f} (long total {fee_long_total:.8f}, short total {fee_short_total:.8f})")
         if funding_events:
             print("Applied funding events:")
             for ev in funding_events:
@@ -525,10 +524,10 @@ class Position:
         return net_pnl
 
 # -------------------- HEALTH CHECK FUNCTION --------------------
-
 def startup_health_check():
     print("\n[Startup] Running exchange connectivity health checks...")
 
+    # Binance exchangeInfo
     try:
         r1 = session.get(BINANCE_INFO_URL, timeout=10)
         if r1.status_code == 200 and "symbols" in r1.json():
@@ -540,9 +539,83 @@ def startup_health_check():
         print("[ERROR] Could not connect to Binance exchangeInfo:", ex)
         return False
 
+    # Binance book ticker
     try:
         r2 = session.get(BINANCE_BOOK_URL, timeout=10)
         if r2.status_code == 200 and isinstance(r2.json(), list):
             print("[OK] Binance bookTicker loaded.")
         else:
-            print("[
+            print("[ERROR] Binance bookTicker not OK. Response:", r2.text)
+            return False
+    except Exception as ex:
+        print("[ERROR] Could not connect to Binance bookTicker:", ex)
+        return False
+
+    # KuCoin contracts active
+    try:
+        r3 = session.get(KUCOIN_ACTIVE_URL, timeout=10)
+        if r3.status_code == 200 and "data" in r3.json():
+            print("[OK] KuCoin contracts active loaded.")
+        else:
+            print("[ERROR] KuCoin active contracts not OK. Response:", r3.text)
+            return False
+    except Exception as ex:
+        print("[ERROR] Could not connect to KuCoin contracts/active:", ex)
+        return False
+
+    # KuCoin ticker for one contract (pick BTCUSDT if present)
+    try:
+        symbols = [s["symbol"] for s in session.get(KUCOIN_ACTIVE_URL, timeout=10).json().get("data", [])]
+        if not symbols:
+            print("[ERROR] No KuCoin contracts available.")
+            return False
+        test_symbol = symbols[0]
+        ticker_url = KUCOIN_TICKER_URL.format(symbol=test_symbol)
+        r4 = session.get(ticker_url, timeout=10)
+        if r4.status_code == 200 and "data" in r4.json():
+            print(f"[OK] KuCoin ticker ({test_symbol}) loaded.")
+        else:
+            print(f"[ERROR] KuCoin ticker ({test_symbol}) not OK. Response:", r4.text)
+            return False
+    except Exception as ex:
+        print("[ERROR] Could not connect to KuCoin ticker endpoint:", ex)
+        return False
+
+    print("[Startup] All API connectivity checks PASSED.\n")
+    return True
+
+# -------------------- MAIN LOOP --------------------
+def main():
+    print("Starting live arbitrage bot (production-ready) -", ts_str())
+
+    # Step 1: Check public IP and prompt whitelisting
+    public_ip = get_public_ip()
+    if not public_ip:
+        print("[Fatal] Could not determine public IP for whitelisting. Please check your network and try again.")
+        sys.exit(1)
+
+    print(f"Your current public IP is: {public_ip}")
+    print("Please whitelist this IP in your Binance API key settings.")
+    print("Waiting for IP to be whitelisted on Binance...")
+
+    # Step 2: Confirm every 3 seconds until IP is whitelisted
+    while True:
+        if check_binance_ip_whitelist(public_ip):
+            print(f"[{ts_str()}] Public IP {public_ip} is whitelisted in Binance. Proceeding...")
+            break
+        else:
+            print(f"[{ts_str()}] Public IP {public_ip} NOT whitelisted yet. Retrying in 3 seconds...")
+            time.sleep(3)
+
+    # Step 3: Proceed with original startup health check and main bot logic
+    if not startup_health_check():
+        print("[Fatal] Startup health check failed. Please check your API credentials, exchange access, and server network, then restart.")
+        sys.exit(1)
+
+    symbols, ku_map = get_common_symbols()
+    if not symbols:
+        print("No common symbols found. Exiting.")
+        return
+    print(f"Found {len(symbols)} common symbols")
+    bin_prec_map = get_binance_symbol_precision_map()
+    ku_prec_map = get_kucoin
