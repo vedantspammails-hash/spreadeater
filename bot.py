@@ -1,18 +1,27 @@
 #!/usr/bin/env python3
 # bot.py - Full production-ready arbitrage bot (Binance + KuCoin futures)
-# (original header and description preserved)
+# Features:
+# - $80 per leg notional, 3x leverage
+# - Market orders with order-status confirmation and slippage logging
+# - Per-symbol quantity rounding (round-down), matched qty between legs
+# - Funding fees applied only for funding events that occur while a position is open
+# - Liquidation detection and immediate close of opposite leg
+# - Spread-based entry/exit: TRADE_TRIGGER, zero-cross exit, PROFIT_TARGET
+# - Reasonable rate-limiting, threaded price fetch for KuCoin
+# - Replace the API keys below before running. Test on testnets first.
 
 import time, hmac, hashlib, json, requests, base64, math, sys
 from urllib.parse import urlencode
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import os
+
 # -------------------- CONFIG --------------------
-BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY", "YOUR_BINANCE_API_KEY")
-BINANCE_API_SECRET = os.environ.get("BINANCE_API_SECRET", "YOUR_BINANCE_API_SECRET")
-KUCOIN_API_KEY = os.environ.get("KUCOIN_API_KEY", "YOUR_KUCOIN_API_KEY")
-KUCOIN_API_SECRET = os.environ.get("KUCOIN_API_SECRET", "YOUR_KUCOIN_API_SECRET")
-KUCOIN_API_PASSPHRASE = os.environ.get("KUCOIN_API_PASSPHRASE", "YOUR_KUCOIN_API_PASSPHRASE")
+BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY", "")
+BINANCE_API_SECRET = os.environ.get("BINANCE_API_SECRET", "")
+KUCOIN_API_KEY = os.environ.get("KUCOIN_API_KEY", "")
+KUCOIN_API_SECRET = os.environ.get("KUCOIN_API_SECRET", "")
+KUCOIN_API_PASSPHRASE = os.environ.get("KUCOIN_API_PASSPHRASE", "")
 SCAN_THRESHOLD = 0.25
 TRADE_TRIGGER = 1.5 # ENTRY THRESHOLD is ±1.5%
 PROFIT_TARGET = 0.60
@@ -24,6 +33,7 @@ POLL_INTERVAL = 0.8 # main loop sleep
 MAX_WORKERS = 8
 ORDER_POLL_INTERVAL = 0.2
 ORDER_POLL_TIMEOUT = 10.0 # seconds to wait for fill
+
 # -------------------- ENDPOINTS --------------------
 BINANCE_BASE = "https://fapi.binance.com"
 KUCOIN_BASE = "https://api-futures.kucoin.com"
@@ -39,9 +49,11 @@ KUCOIN_ORDER_URL = f"{KUCOIN_BASE}/api/v1/orders"
 KUCOIN_ORDER_STATUS = f"{KUCOIN_BASE}/api/v1/orders/{{orderId}}"
 KUCOIN_POSITION_URL = f"{KUCOIN_BASE}/api/v1/position/single?symbol={{symbol}}"
 KUCOIN_FUNDING_URL = f"{KUCOIN_BASE}/api/v1/funding-rate/history?symbol={{symbol}}&pageSize=50"
+
 # -------------------- SESSIONS --------------------
 session = requests.Session()
 session.headers.update({"User-Agent": "LiveArbBot/1.0"})
+
 # -------------------- UTIL --------------------
 def now_ts():
     return int(time.time())
@@ -59,11 +71,13 @@ def floor_to_precision(qty, precision):
 def calc_slippage(expected, filled):
     if expected == 0: return 0.0
     return (filled - expected) / expected * 100.0
+
 # -------------------- BINANCE HELPERS --------------------
 def binance_sign(params):
     query = urlencode(params)
     sig = hmac.new(BINANCE_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
     return sig
+
 def binance_request(method, endpoint, params=None):
     params = params or {}
     params['timestamp'] = int(time.time() * 1000)
@@ -75,6 +89,36 @@ def binance_request(method, endpoint, params=None):
     r = session.request(method, url, headers=headers, params=params, timeout=10)
     r.raise_for_status()
     return r.json()
+
+# Non-raising probe that returns (ok_bool, status_code, parsed_json_or_text)
+def binance_probe():
+    """
+    Try an authenticated Binance request but don't raise.
+    Return (ok, status_code, body_dict_or_text)
+    """
+    try:
+        params = {'timestamp': int(time.time() * 1000), 'recvWindow': 5000}
+        signature = hmac.new(BINANCE_API_SECRET.encode(), urlencode(params).encode(), hashlib.sha256).hexdigest()
+        params['signature'] = signature
+        headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
+        url = BINANCE_BASE + "/fapi/v1/account"
+        r = session.get(url, headers=headers, params=params, timeout=10)
+        try:
+            body = r.json()
+        except:
+            body = r.text
+        return (r.status_code == 200, r.status_code, body)
+    except Exception as e:
+        return (False, None, str(e))
+
+def binance_get_server_time():
+    try:
+        r = session.get(BINANCE_BASE + "/fapi/v1/time", timeout=6)
+        js = r.json()
+        return js.get("serverTime")
+    except:
+        return None
+
 def binance_place_market(symbol, side, quantity):
     params = {"symbol": symbol, "side": side, "type": "MARKET", "quantity": str(quantity)}
     return binance_request("POST", "/fapi/v1/order", params)
@@ -111,6 +155,7 @@ def get_binance_symbol_precision_map():
     except:
         pass
     return out
+
 # -------------------- KUCOIN HELPERS --------------------
 def kucoin_sign(method, endpoint, body=None):
     now = str(int(time.time()*1000))
@@ -119,6 +164,7 @@ def kucoin_sign(method, endpoint, body=None):
     signature = base64.b64encode(hmac.new(KUCOIN_API_SECRET.encode(), str_to_sign.encode(), hashlib.sha256).digest()).decode()
     passphrase = base64.b64encode(hmac.new(KUCOIN_API_SECRET.encode(), KUCOIN_API_PASSPHRASE.encode(), hashlib.sha256).digest()).decode()
     return now, signature, passphrase
+
 def kucoin_request(method, endpoint, body=None, params=None):
     now, sig, passph = kucoin_sign(method, endpoint, body)
     headers = {
@@ -136,6 +182,34 @@ def kucoin_request(method, endpoint, body=None, params=None):
         r = session.post(url, headers=headers, json=body, timeout=10)
     r.raise_for_status()
     return r.json()
+
+# Non-raising KuCoin probe
+def kucoin_probe():
+    """
+    Try an authenticated KuCoin request and return (ok_bool, status_code, parsed_body_or_text)
+    We'll call a basic endpoint that requires authentication: /api/v1/accounts (spot account) — if permissions are wrong you'll get an error.
+    """
+    try:
+        endpoint = "/api/v1/accounts"
+        now, sig, passph = kucoin_sign("GET", endpoint, None)
+        headers = {
+            "KC-API-KEY": KUCOIN_API_KEY,
+            "KC-API-SIGN": sig,
+            "KC-API-TIMESTAMP": now,
+            "KC-API-PASSPHRASE": passph,
+            "KC-API-KEY-VERSION": "2",
+            "Content-Type": "application/json"
+        }
+        url = KUCOIN_BASE + endpoint
+        r = session.get(url, headers=headers, timeout=10)
+        try:
+            body = r.json()
+        except:
+            body = r.text
+        return (r.status_code in (200, 201), r.status_code, body)
+    except Exception as e:
+        return (False, None, str(e))
+
 def kucoin_place_market(symbol, side, size):
     endpoint = "/api/v1/orders"
     body = {
@@ -191,6 +265,7 @@ def get_kucoin_contract_precisions():
     except:
         pass
     return out
+
 # -------------------- MARKET DATA --------------------
 def get_common_symbols():
     try:
@@ -206,6 +281,7 @@ def get_common_symbols():
     except Exception as e:
         print("get_common_symbols error:", e)
         return [], {}
+
 def get_prices(symbols, ku_map):
     bin_book = {}
     try:
@@ -226,6 +302,7 @@ def get_prices(symbols, ku_map):
             except:
                 pass
     return bin_book, ku_prices
+
 def calc_diff(bin_bid, bin_ask, ku_bid, ku_ask):
     if not bin_bid or not bin_ask or not ku_bid or not ku_ask:
         return None
@@ -236,6 +313,7 @@ def calc_diff(bin_bid, bin_ask, ku_bid, ku_ask):
     if neg < -TRADE_TRIGGER:
         return neg
     return None
+
 # -------------------- ORDER UTILITIES --------------------
 def wait_order_binance(symbol, orderId, timeout=ORDER_POLL_TIMEOUT):
     start = time.time()
@@ -249,6 +327,7 @@ def wait_order_binance(symbol, orderId, timeout=ORDER_POLL_TIMEOUT):
             pass
         time.sleep(ORDER_POLL_INTERVAL)
     return None
+
 def wait_order_kucoin(orderId, timeout=ORDER_POLL_TIMEOUT):
     start = time.time()
     while time.time() - start < timeout:
@@ -261,6 +340,7 @@ def wait_order_kucoin(orderId, timeout=ORDER_POLL_TIMEOUT):
             pass
         time.sleep(ORDER_POLL_INTERVAL)
     return None
+
 def extract_fill_price_binance(order):
     fills = order.get("fills") or []
     if not fills:
@@ -274,6 +354,7 @@ def extract_fill_price_binance(order):
         num += p * q
         den += q
     return (num/den) if den else 0.0
+
 def extract_fill_price_kucoin(order_resp):
     data = order_resp.get("data") or {}
     if data.get("filledAvgPrice"):
@@ -282,6 +363,7 @@ def extract_fill_price_kucoin(order_resp):
         except:
             pass
     return float(data.get("dealFunds") or 0) / float(data.get("filledSize") or 1) if data.get("filledSize") else 0.0
+
 # -------------------- FUNDING CALC --------------------
 def compute_funding_impact(position_open_ts, position_close_ts, long_ex_name, short_ex_name, symbol):
     total = 0.0
@@ -326,6 +408,7 @@ def compute_funding_impact(position_open_ts, position_close_ts, long_ex_name, sh
     except:
         pass
     return total, applied
+
 # -------------------- POSITION CLASS --------------------
 class Position:
     def __init__(self, symbol, long_ex, short_ex, long_price, short_price, direction, opened_diff, bin_prec_map, ku_prec_map, ku_map):
@@ -401,6 +484,7 @@ class Position:
         self.slippage_short_pct = calc_slippage(self.short_price, self.fill_price_short) * 100.0 if self.fill_price_short else 0.0
         print(f"[{ts_str()}] Filled long at {self.fill_price_long:.8f} (expected {self.long_price:.8f}), slippage {self.slippage_long_pct:.6f}%")
         print(f"[{ts_str()}] Filled short at {self.fill_price_short:.8f} (expected {self.short_price:.8f}), slippage {self.slippage_short_pct:.6f}")
+
     def check_liquidation(self):
         try:
             b_amt = binance_get_position_amt(self.symbol)
@@ -413,6 +497,7 @@ class Position:
         if abs(b_amt) < 1e-6 or abs(k_amt) < 1e-6:
             return True
         return False
+
     def close(self, close_price_long, close_price_short, close_diff):
         if self.closed:
             return None
@@ -456,6 +541,7 @@ class Position:
         except Exception:
             pass
         return net_pnl
+
 # -------------------- HEALTH CHECK FUNCTION --------------------
 def startup_health_check():
     print("\n[Startup] Running exchange connectivity health checks...")
@@ -512,7 +598,7 @@ def startup_health_check():
     print("[Startup] All API connectivity checks PASSED.\n")
     return True
 
-# -------------------- NEW: PUBLIC IP + BINANCE WHITELIST CHECK --------------------
+# -------------------- NEW DIAGNOSTIC + WHITELIST WAIT --------------------
 def get_public_ip():
     """
     Returns the server's public IP as a string (or None on failure).
@@ -521,8 +607,7 @@ def get_public_ip():
         r = session.get("https://api.ipify.org?format=json", timeout=6)
         j = r.json()
         return j.get("ip")
-    except Exception as e:
-        # fallback using another service
+    except Exception:
         try:
             r = session.get("https://ifconfig.me/all.json", timeout=6)
             j = r.json()
@@ -530,50 +615,174 @@ def get_public_ip():
         except:
             return None
 
+def check_env_vars():
+    """
+    Quick checks for presence of key env vars and placeholder values.
+    """
+    missing = []
+    placeholders = []
+    pairs = {
+        "BINANCE_API_KEY": BINANCE_API_KEY,
+        "BINANCE_API_SECRET": BINANCE_API_SECRET,
+        "KUCOIN_API_KEY": KUCOIN_API_KEY,
+        "KUCOIN_API_SECRET": KUCOIN_API_SECRET,
+        "KUCOIN_API_PASSPHRASE": KUCOIN_API_PASSPHRASE
+    }
+    for k, v in pairs.items():
+        if not v:
+            missing.append(k)
+        # naive placeholder detection
+        if v and ("YOUR_" in v or v.strip() in ("-", "******", "********", "default", "changeme")):
+            placeholders.append(k)
+    return missing, placeholders
+
+def explain_binance_error(status_code, body):
+    """
+    Attempt to infer the root cause from Binance probe response.
+    Returns short string explanation.
+    """
+    try:
+        if isinstance(body, dict):
+            msg = (body.get("msg") or body.get("message") or str(body)).lower()
+            code = body.get("code")
+        else:
+            msg = str(body).lower()
+            code = None
+        if status_code is None:
+            return "Network error or request exception. Check outbound connectivity and DNS."
+        if status_code == 401 or "invalid api-key" in msg or code == -2015:
+            # generic Binance invalid -> this can be invalid key, wrong secret (signature), IP not whitelisted, or missing perms
+            # distinguish by message words:
+            if "ip" in msg and "whitelist" in msg:
+                return "Binance says IP is not whitelisted. Confirm the public IP you added matches server public IP and that the API key is set to restrict to that IP."
+            if "recvwindow" in msg or "timestamp for this request" in msg or "time" in msg or "ahead" in msg:
+                return "Timestamp / clock skew issue. Sync server clock (NTP). See server time vs Binance server time check below."
+            if "signature" in msg or "signature for this request is not valid" in msg:
+                return "Signature invalid — check BINANCE_API_SECRET is correct and that no extra characters/whitespace are set in env var."
+            # fallback
+            return "Authentication failed. Could be invalid key/secret, IP whitelist mismatch, or missing permissions."
+        if status_code == 403:
+            return "Forbidden — IP may be blocked or API key lacks required permissions."
+        if status_code == 418 or status_code == 429:
+            return "Rate limited or banned temporarily by Binance. Check call volume and possible bans."
+        if status_code >= 500:
+            return "Exchange-side error (5xx). Try again later."
+        # otherwise fallback to message content
+        if "ip" in msg and "whitelist" in msg:
+            return "Binance indicates IP whitelist issue."
+        return None
+    except Exception:
+        return None
+
+def explain_kucoin_error(status_code, body):
+    try:
+        if isinstance(body, dict):
+            msg = json.dumps(body).lower()
+        else:
+            msg = str(body).lower()
+        if status_code is None:
+            return "Network error or request exception. Check outbound connectivity and DNS."
+        if status_code in (401, 403):
+            return "KuCoin authentication/permission failure. Check API key, passphrase, secret and that the key is enabled for futures/trading as needed."
+        if "timestamp" in msg or "sign" in msg or "signature" in msg:
+            return "KuCoin signature/timestamp error — check system clock and KUCOIN_API_SECRET/PASSPHRASE correctness."
+        return None
+    except:
+        return None
+
+def check_time_skew_and_report():
+    s_time = binance_get_server_time()
+    if s_time is None:
+        print("[TIME CHECK] Could not fetch Binance server time.")
+        return
+    s_time = int(s_time) / 1000.0
+    local = time.time()
+    skew = local - s_time
+    print(f"[TIME CHECK] Local time: {ts_str(local)}, Binance server time: {ts_str(s_time)}, skew = {skew:+.3f} seconds")
+    if abs(skew) > 2.0:
+        print("[TIME CHECK] WARNING: Clock skew > 2s. This often causes signature/timestamp errors. Sync your server clock with NTP (e.g., `sudo ntpdate -u pool.ntp.org` or enable systemd-timesyncd).")
+
 def wait_for_binance_whitelist(poll_interval=3):
     """
-    Prints the public IP to whitelist and then polls Binance with an authenticated request
-    every poll_interval seconds until a successful authenticated response is received.
-    A successful binance_request() (no exception) is treated as 'IP whitelisted'.
+    Prints the public IP to whitelist, does a broad diagnostics sweep and then polls Binance every poll_interval seconds
+    until we see a successful authenticated response. While waiting it diagnosis reasons and prints actionable suggestions.
     """
-    ip = get_public_ip()
-    if not ip:
-        print("[WHITELIST CHECK] Could not determine public IP address. Please obtain the server IP manually and add to Binance IP whitelist, then press Ctrl+C to stop and restart the bot after whitelisting.")
-        # still continue trying using a loop that attempts the authenticated call (user may still want to proceed)
+    print("\n[DIAG] Starting diagnostics for API / IP / signature issues...\n")
+    missing, placeholders = check_env_vars()
+    if missing:
+        print("[DIAG] Missing environment variables detected:", missing)
+        print(" - Add the missing variables to Railway's Environment, then restart.")
+    if placeholders:
+        print("[DIAG] Some variables look like placeholders or defaults:", placeholders)
+        print(" - Make sure to paste the real keys/secrets and avoid extra quotes/newlines.")
+    public_ip = get_public_ip()
+    if public_ip:
+        print(f"[DIAG] Server public IP (paste this into Binance API IP whitelist for your key): {public_ip}")
     else:
-        print(f"[WHITELIST CHECK] Server public IP: {ip}")
-        print("[WHITELIST CHECK] Please add this IP to your Binance API key IP whitelist.")
-    print(f"[WHITELIST CHECK] Now polling Binance every {poll_interval} seconds to confirm whitelist...")
+        print("[DIAG] Could not determine public IP automatically. Find your server's public IP and add it to the Binance API key whitelist.")
 
+    # check time skew immediately
+    check_time_skew_and_report()
+
+    print(f"[DIAG] Polling Binance auth every {poll_interval}s until an authenticated call succeeds. (Will also probe KuCoin each loop for clarity.)")
+    loop_count = 0
     while True:
-        try:
-            # Try an authenticated Binance endpoint that requires a whitelisted IP & valid API key.
-            # Using /fapi/v1/account (requires signature & API key). If IP isn't whitelisted, this should fail.
-            resp = binance_request("GET", "/fapi/v1/account", {})
-            # If we got a JSON response without raising, we consider the IP whitelisted (and keys valid).
-            print(f"[{ts_str()}] Binance authenticated call succeeded. IP appears whitelisted and credentials accepted.")
+        loop_count += 1
+        print(f"\n[{ts_str()}] Diagnostic attempt #{loop_count} ...")
+        # BINANCE probe
+        b_ok, b_status, b_body = binance_probe()
+        if b_ok:
+            print(f"[{ts_str()}] Binance authenticated request SUCCEEDED (status={b_status}). IP is whitelisted and credentials accepted.")
+            # also probe KuCoin briefly and show results
+            k_ok, k_status, k_body = kucoin_probe()
+            if k_ok:
+                print(f"[{ts_str()}] KuCoin authenticated request SUCCEEDED (status={k_status}).")
+            else:
+                k_expl = explain_kucoin_error(k_status, k_body)
+                print(f"[{ts_str()}] KuCoin probe failed: status={k_status}, body={k_body}")
+                if k_expl:
+                    print(" KuCoin hint:", k_expl)
             return True
-        except Exception as e:
-            # Print a concise user-friendly message; don't expose stack traces
-            print(f"[{ts_str()}] Binance authenticated call failed (likely IP not whitelisted or keys invalid). Retrying in {poll_interval} seconds...")
+        else:
+            # not ok -> parse and give suggestions
+            print(f"[{ts_str()}] Binance authenticated request FAILED. status={b_status}, body={b_body}")
+            expl = explain_binance_error(b_status, b_body)
+            if expl:
+                print(" Suggestion:", expl)
+            else:
+                # fallback: print raw body for debugging (this won't print secrets but only server response)
+                print(" Binance probe response did not match common patterns; raw response above can help.")
+            # Extra checks that commonly cause issues:
+            # 1) Clock skew
+            check_time_skew_and_report()
+            # 2) Basic KuCoin probe to highlight if KuCoin keys are also problematic
+            k_ok, k_status, k_body = kucoin_probe()
+            if not k_ok:
+                k_expl = explain_kucoin_error(k_status, k_body)
+                print(f"[{ts_str()}] KuCoin probe result: status={k_status}, body={k_body}")
+                if k_expl:
+                    print(" KuCoin hint:", k_expl)
+            else:
+                print(f"[{ts_str()}] KuCoin authenticated request SUCCEEDED (status={k_status}).")
+            print(f"[DIAG] Will retry Binance probe in {poll_interval} seconds. If you recently whitelisted the IP on Binance, note that it may take a few seconds to propagate.")
             time.sleep(poll_interval)
 
 # -------------------- MAIN LOOP --------------------
 def main():
     print("Starting live arbitrage bot (production-ready) -", ts_str())
 
-    # NEW: Show public IP and wait until Binance accepts authenticated calls (IP whitelisted)
+    # NEW: Diagnostic + Wait until Binance accepts authenticated calls
     try:
         wait_for_binance_whitelist(poll_interval=3)
     except KeyboardInterrupt:
-        print("[WHITELIST CHECK] Interrupted by user. Exiting.")
+        print("[DIAG] Interrupted by user. Exiting.")
         sys.exit(1)
-    # After whitelist confirmed, continue as normal
 
-    # Health check
+    # After whitelist & authentication confirmed, continue with the original startup health checks
     if not startup_health_check():
         print("[Fatal] Startup health check failed. Please check your API credentials, exchange access, and server network, then restart.")
         sys.exit(1)
+
     symbols, ku_map = get_common_symbols()
     if not symbols:
         print("No common symbols found. Exiting.")
@@ -653,5 +862,6 @@ def main():
                 time.sleep(2.0)
     except KeyboardInterrupt:
         print("Stopping by user")
+
 if __name__ == "__main__":
     main()
