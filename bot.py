@@ -32,6 +32,7 @@ POLL_INTERVAL = 0.8  # main loop sleep
 MAX_WORKERS = 8
 ORDER_POLL_INTERVAL = 0.2
 ORDER_POLL_TIMEOUT = 10.0  # seconds to wait for fill
+VERBOSE = True  # Set to False for silent scanning; True to log best spreads
 
 # -------------------- ENDPOINTS --------------------
 BINANCE_BASE = "https://fapi.binance.com"
@@ -258,15 +259,31 @@ def get_prices(symbols, ku_map):
     except:
         pass
 
+    # FIXED: Batch KuCoin fetches to avoid rate limits (groups of 10, parallel batches)
     ku_prices = {}
-    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(symbols) or 1)) as ex:
-        futures = {ex.submit(session.get, KUCOIN_TICKER_URL.format(symbol=ku_map[s]), {"timeout":5}): s for s in symbols}
-        for fut in as_completed(futures):
-            s = futures[fut]
+    batch_size = 10
+    batches = [symbols[i:i + batch_size] for i in range(0, len(symbols), batch_size)]
+    with ThreadPoolExecutor(max_workers=4) as ex:  # Fewer workers for batches
+        batch_futures = {}
+        for batch_idx, batch in enumerate(batches):
+            def fetch_batch(b):
+                batch_prices = {}
+                for sym in b:
+                    ku_sym = ku_map[sym]
+                    try:
+                        r = session.get(KUCOIN_TICKER_URL.format(symbol=ku_sym), timeout=5)
+                        j = r.json().get("data", {})
+                        batch_prices[ku_sym] = {"bid": float(j.get("bestBidPrice") or 0), "ask": float(j.get("bestAskPrice") or 0)}
+                        time.sleep(0.1)  # Gentle rate limiting within batch
+                    except:
+                        pass
+                return batch_prices
+            future = ex.submit(fetch_batch, batch)
+            batch_futures[future] = batch_idx
+        for fut in as_completed(batch_futures):
             try:
-                r = fut.result()
-                j = r.json().get("data", {})
-                ku_prices[ku_map[s]] = {"bid": float(j.get("bestBidPrice") or 0), "ask": float(j.get("bestAskPrice") or 0)}
+                batch_res = fut.result()
+                ku_prices.update(batch_res)
             except:
                 pass
     return bin_book, ku_prices
@@ -587,6 +604,8 @@ def main():
         while True:
             try:
                 bin_book, ku_prices = get_prices(symbols, ku_map)
+                # Optional: Log fetch counts to debug
+                print(f"[{ts_str()}] Fetched {len(bin_book)} Binance, {len(ku_prices)} KuCoin prices")
 
                 if open_pos:
                     b = bin_book.get(open_pos.symbol)
@@ -634,6 +653,10 @@ def main():
                         best_diff = diff
                         best_sym = s
                         best_pair = (b, k)
+
+                # NEW: Optional verbose logging for best spread
+                if VERBOSE and best_sym:
+                    print(f"[{ts_str()}] Best spread: {best_sym} {best_diff:+.2f}% (trigger at ±{TRADE_TRIGGER}%)")
 
                 if best_sym and abs(best_diff) >= TRADE_TRIGGER:
                     b, k = best_pair
