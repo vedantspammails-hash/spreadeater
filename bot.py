@@ -337,105 +337,79 @@ def safe_create_order(exchange,side,notional,price,symbol, trigger_time=None, tr
         print(f"{exchange.id.upper()} order failed: {e}")
         return False, None, None
 
-# -------------------- NEW: Match notionals helper --------------------
-def match_notional_per_exchange(bin_exchange, kc_exchange, bin_symbol, kc_symbol, desired_usdt, bin_price, kc_price):
+# -------------------- NEW: match exposure by BASE TOKEN --------------------
+def match_base_exposure_per_exchange(bin_exchange, kc_exchange, bin_symbol, kc_symbol, desired_usdt, bin_price, kc_price):
     """
-    Return (notional_for_binance, notional_for_kucoin) such that the implied USDT exposure
-    of the computed amounts on both exchanges is as close as possible, by nudging each
-    notional in contract-sized increments (within MARGIN_BUFFER).
+    Aim: ensure both exchanges get the SAME base-token exposure (e.g., same TRUST amount),
+    by converting the desired USDT into a base amount using the average trigger price,
+    then rounding that base amount to each exchange's allowed amount/contract precision.
+    Returns: (notional_for_binance_usdt, notional_for_kucoin_usdt, bin_base_amount, kc_contracts)
     """
-    # bounds
-    max_allowed = desired_usdt * MARGIN_BUFFER
-    min_allowed = desired_usdt / MARGIN_BUFFER
+    # Load markets and get market metadata
+    m_bin = get_market(bin_exchange, bin_symbol)
+    m_kc = get_market(kc_exchange, kc_symbol)
+    # Safeguards
+    bin_prec = None
+    kc_prec = None
+    bin_contract_size = 1.0
+    kc_contract_size = 1.0
+    try:
+        if m_bin:
+            prec = m_bin.get('precision')
+            if isinstance(prec, dict): bin_prec = prec.get('amount')
+            bin_contract_size = float(m_bin.get('contractSize') or m_bin.get('info', {}).get('contractSize') or 1.0)
+    except: pass
+    try:
+        if m_kc:
+            prec = m_kc.get('precision')
+            if isinstance(prec, dict): kc_prec = prec.get('amount')
+            kc_contract_size = float(m_kc.get('contractSize') or m_kc.get('info', {}).get('contractSize') or 1.0)
+    except: pass
 
-    # initial compute
-    bin_amt, bin_implied, bin_cs, bin_prec = compute_amount_for_notional(bin_exchange, bin_symbol, desired_usdt, bin_price)
-    kc_amt, kc_implied, kc_cs, kc_prec = compute_amount_for_notional(kc_exchange, kc_symbol, desired_usdt, kc_price)
+    # Reference price: average of the two trigger prices (less bias)
+    try:
+        ref_price = (float(bin_price) + float(kc_price)) / 2.0
+        if ref_price <= 0: ref_price = float(bin_price) or float(kc_price) or 1.0
+    except:
+        ref_price = float(bin_price) or float(kc_price) or 1.0
 
-    # if both implied exposures are close already, just return desired_usdt
-    if bin_implied is not None and kc_implied is not None:
-        if abs(bin_implied - kc_implied) <= 0.01:  # 1 cent tolerance
-            return desired_usdt, desired_usdt
+    # Convert desired_usdt -> target base token amount
+    target_base = desired_usdt / ref_price
 
-    # Determine minimal increment in USDT that changes amount by 1 unit on each exchange
-    # For binance: one base unit -> implied change = contract_size * price
-    bin_increment_usdt = (bin_cs * bin_price) if bin_cs and bin_price else desired_usdt * 0.01
-    # For kucoin: one contract -> implied change = contract_size * price
-    kc_increment_usdt = (kc_cs * kc_price) if kc_cs and kc_price else desired_usdt * 0.01
+    # Now round target_base to each exchange's allowed representation
+    # Binance wants base tokens (amount)
+    bin_base_amount = round_down(target_base, bin_prec) if bin_prec is not None else target_base
 
-    # Start from desired_usdt and try to adjust the smaller implied up or larger implied down
-    notional_bin = desired_usdt
-    notional_kc = desired_usdt
+    # KuCoin wants contracts: contracts = base_amount / contract_size
+    kc_contracts = 0.0
+    if kc_contract_size and kc_contract_size > 0:
+        kc_contracts = round_down(target_base / kc_contract_size, kc_prec) if kc_prec is not None else (target_base / kc_contract_size)
+    else:
+        kc_contracts = round_down(target_base, kc_prec) if kc_prec is not None else target_base
 
-    # compute implied function helper
-    def implied_for(exchange, symbol, notional, price):
-        _, implied, _, _ = compute_amount_for_notional(exchange, symbol, notional, price)
-        return implied or 0.0
+    # Convert back to per-exchange notionals using trigger prices (these are the notional values passed to safe_create_order)
+    notional_bin = bin_base_amount * float(bin_price)
+    notional_kc = kc_contracts * float(kc_contract_size) * float(kc_price)
 
-    # current implieds
-    cur_bin_implied = implied_for(bin_exchange, bin_symbol, notional_bin, bin_price)
-    cur_kc_implied = implied_for(kc_exchange, kc_symbol, notional_kc, kc_price)
-
-    # If either implied is zero (bad), just return desired
-    if cur_bin_implied == 0 or cur_kc_implied == 0:
-        return desired_usdt, desired_usdt
-
-    # Try to minimize absolute difference by iteratively nudging the side with smaller implied upward,
-    # or the larger side downward, whichever produces smaller abs diff, within bounds.
-    best = (notional_bin, notional_kc, abs(cur_bin_implied - cur_kc_implied))
-    steps = 0
-    max_steps = 60
-
-    while steps < max_steps and best[2] > 0.0001:
-        steps += 1
-        diff = cur_bin_implied - cur_kc_implied
-        # If bin implied > kc implied, try to increase kc notional or decrease bin notional
-        candidates = []
-        if diff > 0:
-            # increase kc
-            cand_kc = min(notional_kc + kc_increment_usdt, max_allowed)
-            if cand_kc != notional_kc:
-                cand_kc_implied = implied_for(kc_exchange, kc_symbol, cand_kc, kc_price)
-                candidates.append((notional_bin, cand_kc, abs(cur_bin_implied - cand_kc_implied), cur_bin_implied, cand_kc_implied))
-            # decrease bin
-            cand_bin = max(notional_bin - bin_increment_usdt, min_allowed)
-            if cand_bin != notional_bin:
-                cand_bin_implied = implied_for(bin_exchange, bin_symbol, cand_bin, bin_price)
-                candidates.append((cand_bin, notional_kc, abs(cand_bin_implied - cur_kc_implied), cand_bin_implied, cur_kc_implied))
+    # final safety: if rounding produced zero on either side, fallback to small positive amount
+    if bin_base_amount <= 0:
+        # compute minimal positive amount (one step)
+        step_bin = (bin_contract_size * bin_price) if bin_contract_size and bin_price else (desired_usdt * 0.001)
+        if bin_prec is not None:
+            bin_base_amount = round_down(step_bin / bin_price, bin_prec)
         else:
-            # kc implied > bin implied: increase bin or decrease kc
-            cand_bin = min(notional_bin + bin_increment_usdt, max_allowed)
-            if cand_bin != notional_bin:
-                cand_bin_implied = implied_for(bin_exchange, bin_symbol, cand_bin, bin_price)
-                candidates.append((cand_bin, notional_kc, abs(cand_bin_implied - cur_kc_implied), cand_bin_implied, cur_kc_implied))
-            cand_kc = max(notional_kc - kc_increment_usdt, min_allowed)
-            if cand_kc != notional_kc:
-                cand_kc_implied = implied_for(kc_exchange, kc_symbol, cand_kc, kc_price)
-                candidates.append((notional_bin, cand_kc, abs(cur_bin_implied - cand_kc_implied), cur_bin_implied, cand_kc_implied))
-
-        if not candidates:
-            break
-
-        # pick candidate with smallest abs diff
-        candidates.sort(key=lambda x: x[2])
-        chosen = candidates[0]
-        new_bin_notional, new_kc_notional, new_diff, new_bin_implied, new_kc_implied = chosen
-        # apply chosen
-        notional_bin, notional_kc = new_bin_notional, new_kc_notional
-        cur_bin_implied = new_bin_implied if new_bin_implied is not None else implied_for(bin_exchange, bin_symbol, notional_bin, bin_price)
-        cur_kc_implied = new_kc_implied if new_kc_implied is not None else implied_for(kc_exchange, kc_symbol, notional_kc, kc_price)
-        # update best if improved
-        if new_diff < best[2]:
-            best = (notional_bin, notional_kc, new_diff)
+            bin_base_amount = step_bin / bin_price
+        notional_bin = bin_base_amount * float(bin_price)
+    if kc_contracts <= 0:
+        step_kc = (kc_contract_size * kc_price) if kc_contract_size and kc_price else (desired_usdt * 0.001)
+        if kc_prec is not None:
+            kc_contracts = round_down((step_kc / kc_contract_size) if kc_contract_size else step_kc, kc_prec)
         else:
-            # if no improvement, break to avoid oscillation
-            break
+            kc_contracts = (step_kc / kc_contract_size) if kc_contract_size else step_kc
+        notional_kc = kc_contracts * float(kc_contract_size) * float(kc_price)
 
-    # Final safety clamp within allowed bounds
-    notional_bin = max(min(best[0], max_allowed), min_allowed)
-    notional_kc = max(min(best[1], max_allowed), min_allowed)
+    return float(notional_bin), float(notional_kc), float(bin_base_amount), float(kc_contracts)
 
-    return float(notional_bin), float(notional_kc)
 # -------------------------------------------------------------------
 
 def get_prices():
@@ -491,8 +465,10 @@ while True:
                         print(f"{trigger_time.strftime('%H:%M:%S.%f')[:-3]} ENTRY CASE A CONFIRMED 3/3 -> EXECUTING PARALLEL ORDERS")
                        
                         # PARALLEL ORDER EXECUTION
-                        # ---------- NEW: compute matched notionals ----------
-                        notional_bin, notional_kc = match_notional_per_exchange(binance, kucoin, sym, kc_trade_sym, NOTIONAL, bin_ask, kc_bid)
+                        # ---------- NEW: compute matched base-token exposure ----------
+                        notional_bin, notional_kc, bin_base_amt, kc_contracts = match_base_exposure_per_exchange(
+                            binance, kucoin, sym, kc_trade_sym, NOTIONAL, bin_ask, kc_bid
+                        )
                         # Execute with per-exchange notionals
                         results = {}
                         def exec_kc(): results['kc'] = safe_create_order(kucoin,'sell',notional_kc,kc_bid,kc_trade_sym, trigger_time=trigger_time, trigger_price=kc_bid)
@@ -522,10 +498,11 @@ while True:
                                 if exec_time_kc: lat_kc = int(datetime.fromisoformat(exec_time_kc.replace('Z','')).timestamp()*1000) - t0_ms
                                 if exec_time_bin: lat_bin = int(datetime.fromisoformat(exec_time_bin.replace('Z','')).timestamp()*1000) - t0_ms
                             except: pass
-                            # Print matched-notional debug summary
+                            # Print matched-base-token debug summary
                             try:
                                 implied_bin = compute_amount_for_notional(binance, sym, notional_bin, exec_price_bin)[1]
                                 implied_kc = compute_amount_for_notional(kucoin, kc_trade_sym, notional_kc, exec_price_kc)[1]
+                                print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} MATCHED BASE TARGET | bin_base_amount={bin_base_amt} | kc_contracts={kc_contracts}")
                                 print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} MATCHED NOTIONALS | bin_notional=${notional_bin:.6f} implied=${implied_bin:.8f} | kc_notional=${notional_kc:.6f} implied=${implied_kc:.8f}")
                             except Exception:
                                 pass
@@ -554,8 +531,10 @@ while True:
                         entry_actual[sym]['trigger_time'] = trigger_time
                         entry_actual[sym]['trigger_price'] = {'binance':bin_bid,'kucoin':kc_ask}
                         print(f"{trigger_time.strftime('%H:%M:%S.%f')[:-3]} ENTRY CASE B CONFIRMED 3/3 -> EXECUTING PARALLEL ORDERS")
-                        # ---------- NEW: compute matched notionals ----------
-                        notional_bin, notional_kc = match_notional_per_exchange(binance, kucoin, sym, kc_trade_sym, NOTIONAL, bin_bid, kc_ask)
+                        # ---------- NEW: compute matched base-token exposure ----------
+                        notional_bin, notional_kc, bin_base_amt, kc_contracts = match_base_exposure_per_exchange(
+                            binance, kucoin, sym, kc_trade_sym, NOTIONAL, bin_bid, kc_ask
+                        )
                         results = {}
                         def exec_kc(): results['kc'] = safe_create_order(kucoin,'buy',notional_kc,kc_ask,kc_trade_sym, trigger_time=trigger_time, trigger_price=kc_ask)
                         def exec_bin(): results['bin'] = safe_create_order(binance,'sell',notional_bin,bin_bid,sym, trigger_time=trigger_time, trigger_price=bin_bid)
@@ -584,10 +563,11 @@ while True:
                                 if exec_time_kc: lat_kc = int(datetime.fromisoformat(exec_time_kc.replace('Z','')).timestamp()*1000) - t0_ms
                                 if exec_time_bin: lat_bin = int(datetime.fromisoformat(exec_time_bin.replace('Z','')).timestamp()*1000) - t0_ms
                             except: pass
-                            # Print matched-notional debug summary
+                            # Print matched-base-token debug summary
                             try:
                                 implied_bin = compute_amount_for_notional(binance, sym, notional_bin, exec_price_bin)[1]
                                 implied_kc = compute_amount_for_notional(kucoin, kc_trade_sym, notional_kc, exec_price_kc)[1]
+                                print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} MATCHED BASE TARGET | bin_base_amount={bin_base_amt} | kc_contracts={kc_contracts}")
                                 print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} MATCHED NOTIONALS | bin_notional=${notional_bin:.6f} implied=${implied_bin:.8f} | kc_notional=${notional_kc:.6f} implied=${implied_kc:.8f}")
                             except Exception:
                                 pass
