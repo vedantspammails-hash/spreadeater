@@ -17,8 +17,8 @@ SYMBOLS = ["GPSUSDT"]
 KUCOIN_SYMBOLS = ["GPSUSDTM"]
 NOTIONAL = 10.0
 LEVERAGE = 6
-ENTRY_SPREAD = 1.7
-PROFIT_TARGET = 0.6
+ENTRY_SPREAD = 0.9
+PROFIT_TARGET = 0.3
 MARGIN_BUFFER = 1.02
 print(f"\n{'='*72}")
 print(f"SINGLE COIN 4x LIVE ARB BOT | NOTIONAL ${NOTIONAL} @ {LEVERAGE}x | ENTRY >= {ENTRY_SPREAD}% | PROFIT TARGET {PROFIT_TARGET}%")
@@ -620,4 +620,5 @@ while True:
     except Exception as e:
         print("ERROR:",e)
         time.sleep(0.5)
+
 
