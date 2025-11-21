@@ -5,7 +5,7 @@ import os, sys, time, math, requests
 from datetime import datetime
 from dotenv import load_dotenv
 import ccxt
-import threading  # NEW: for parallel order execution
+import threading # NEW: for parallel order execution
 load_dotenv()
 REQUIRED = ['BINANCE_API_KEY','BINANCE_API_SECRET','KUCOIN_API_KEY','KUCOIN_API_SECRET','KUCOIN_API_PASSPHRASE']
 missing = [k for k in REQUIRED if not os.getenv(k)]
@@ -120,11 +120,9 @@ entry_spreads = {s:0.0 for s in SYMBOLS}
 entry_prices = {s:{'binance':0,'kucoin':0} for s in SYMBOLS}
 # --- NEW: store actual executed info ---
 entry_actual = {s:{'binance':None,'kucoin':None,'trigger_time':None,'trigger_price':None} for s in SYMBOLS}
-
 # --- CONFIRMATION COUNTERS (NEW) ---
 entry_confirm_count = {s: 0 for s in SYMBOLS}
 exit_confirm_count = {s: 0 for s in SYMBOLS}
-
 # --- NEW: Get Total Futures Balance in USDT ---
 def get_total_futures_balance():
     try:
@@ -137,7 +135,6 @@ def get_total_futures_balance():
     except Exception as e:
         print(f"Error fetching balances: {e}")
         return 0.0, 0.0, 0.0
-
 def has_open_positions():
     try:
         for sym in SYMBOLS:
@@ -170,14 +167,13 @@ def has_open_positions():
                     pass
         return False
     except: return True
-
 # --- FIXED close_all_and_wait: use authenticated ccxt.fetch_positions to get KuCoin positions ---
 def close_all_and_wait(timeout_s=20,poll_interval=0.5):
     global closing_in_progress
     print("\n" + "="*72)
     print("Closing all positions...")
     print("="*72)
-  
+ 
     for sym in SYMBOLS:
         try:
             positions_bin = binance.fetch_positions([sym])
@@ -196,7 +192,6 @@ def close_all_and_wait(timeout_s=20,poll_interval=0.5):
                             print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} BINANCE close order failed: {e}")
         except Exception as e:
             print(f"Binance close error for {sym}: {e}")
-
     all_kc_positions = []
     try:
         all_kc_positions = kucoin.fetch_positions(symbols=KUCOIN_TRADE_SYMBOLS)
@@ -231,7 +226,6 @@ def close_all_and_wait(timeout_s=20,poll_interval=0.5):
                     kucoin.create_market_order(ccxt_sym, side, qty, params={'reduceOnly': True, 'marginMode': 'cross'})
                 except Exception as e:
                     print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} KUCOIN close order failed: {e}")
-
     start = time.time()
     while time.time() - start < timeout_s:
         if not has_open_positions():
@@ -246,7 +240,6 @@ def close_all_and_wait(timeout_s=20,poll_interval=0.5):
     print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Timeout waiting for positions to close.")
     print("="*72)
     return False
-
 # --- NEW helper: robust executed price/time extractor ---
 def extract_executed_price_and_time(exchange, symbol, order_obj):
     try:
@@ -306,7 +299,6 @@ def extract_executed_price_and_time(exchange, symbol, order_obj):
     except Exception:
         pass
     return None, None
-
 # safe_create_order extended to capture executed price/time, slippage & latency and log them
 def safe_create_order(exchange,side,notional,price,symbol, trigger_time=None, trigger_price=None):
     amt,_,_,prec = compute_amount_for_notional(exchange,symbol,notional,price)
@@ -345,6 +337,107 @@ def safe_create_order(exchange,side,notional,price,symbol, trigger_time=None, tr
         print(f"{exchange.id.upper()} order failed: {e}")
         return False, None, None
 
+# -------------------- NEW: Match notionals helper --------------------
+def match_notional_per_exchange(bin_exchange, kc_exchange, bin_symbol, kc_symbol, desired_usdt, bin_price, kc_price):
+    """
+    Return (notional_for_binance, notional_for_kucoin) such that the implied USDT exposure
+    of the computed amounts on both exchanges is as close as possible, by nudging each
+    notional in contract-sized increments (within MARGIN_BUFFER).
+    """
+    # bounds
+    max_allowed = desired_usdt * MARGIN_BUFFER
+    min_allowed = desired_usdt / MARGIN_BUFFER
+
+    # initial compute
+    bin_amt, bin_implied, bin_cs, bin_prec = compute_amount_for_notional(bin_exchange, bin_symbol, desired_usdt, bin_price)
+    kc_amt, kc_implied, kc_cs, kc_prec = compute_amount_for_notional(kc_exchange, kc_symbol, desired_usdt, kc_price)
+
+    # if both implied exposures are close already, just return desired_usdt
+    if bin_implied is not None and kc_implied is not None:
+        if abs(bin_implied - kc_implied) <= 0.01:  # 1 cent tolerance
+            return desired_usdt, desired_usdt
+
+    # Determine minimal increment in USDT that changes amount by 1 unit on each exchange
+    # For binance: one base unit -> implied change = contract_size * price
+    bin_increment_usdt = (bin_cs * bin_price) if bin_cs and bin_price else desired_usdt * 0.01
+    # For kucoin: one contract -> implied change = contract_size * price
+    kc_increment_usdt = (kc_cs * kc_price) if kc_cs and kc_price else desired_usdt * 0.01
+
+    # Start from desired_usdt and try to adjust the smaller implied up or larger implied down
+    notional_bin = desired_usdt
+    notional_kc = desired_usdt
+
+    # compute implied function helper
+    def implied_for(exchange, symbol, notional, price):
+        _, implied, _, _ = compute_amount_for_notional(exchange, symbol, notional, price)
+        return implied or 0.0
+
+    # current implieds
+    cur_bin_implied = implied_for(bin_exchange, bin_symbol, notional_bin, bin_price)
+    cur_kc_implied = implied_for(kc_exchange, kc_symbol, notional_kc, kc_price)
+
+    # If either implied is zero (bad), just return desired
+    if cur_bin_implied == 0 or cur_kc_implied == 0:
+        return desired_usdt, desired_usdt
+
+    # Try to minimize absolute difference by iteratively nudging the side with smaller implied upward,
+    # or the larger side downward, whichever produces smaller abs diff, within bounds.
+    best = (notional_bin, notional_kc, abs(cur_bin_implied - cur_kc_implied))
+    steps = 0
+    max_steps = 60
+
+    while steps < max_steps and best[2] > 0.0001:
+        steps += 1
+        diff = cur_bin_implied - cur_kc_implied
+        # If bin implied > kc implied, try to increase kc notional or decrease bin notional
+        candidates = []
+        if diff > 0:
+            # increase kc
+            cand_kc = min(notional_kc + kc_increment_usdt, max_allowed)
+            if cand_kc != notional_kc:
+                cand_kc_implied = implied_for(kc_exchange, kc_symbol, cand_kc, kc_price)
+                candidates.append((notional_bin, cand_kc, abs(cur_bin_implied - cand_kc_implied), cur_bin_implied, cand_kc_implied))
+            # decrease bin
+            cand_bin = max(notional_bin - bin_increment_usdt, min_allowed)
+            if cand_bin != notional_bin:
+                cand_bin_implied = implied_for(bin_exchange, bin_symbol, cand_bin, bin_price)
+                candidates.append((cand_bin, notional_kc, abs(cand_bin_implied - cur_kc_implied), cand_bin_implied, cur_kc_implied))
+        else:
+            # kc implied > bin implied: increase bin or decrease kc
+            cand_bin = min(notional_bin + bin_increment_usdt, max_allowed)
+            if cand_bin != notional_bin:
+                cand_bin_implied = implied_for(bin_exchange, bin_symbol, cand_bin, bin_price)
+                candidates.append((cand_bin, notional_kc, abs(cand_bin_implied - cur_kc_implied), cand_bin_implied, cur_kc_implied))
+            cand_kc = max(notional_kc - kc_increment_usdt, min_allowed)
+            if cand_kc != notional_kc:
+                cand_kc_implied = implied_for(kc_exchange, kc_symbol, cand_kc, kc_price)
+                candidates.append((notional_bin, cand_kc, abs(cur_bin_implied - cand_kc_implied), cur_bin_implied, cand_kc_implied))
+
+        if not candidates:
+            break
+
+        # pick candidate with smallest abs diff
+        candidates.sort(key=lambda x: x[2])
+        chosen = candidates[0]
+        new_bin_notional, new_kc_notional, new_diff, new_bin_implied, new_kc_implied = chosen
+        # apply chosen
+        notional_bin, notional_kc = new_bin_notional, new_kc_notional
+        cur_bin_implied = new_bin_implied if new_bin_implied is not None else implied_for(bin_exchange, bin_symbol, notional_bin, bin_price)
+        cur_kc_implied = new_kc_implied if new_kc_implied is not None else implied_for(kc_exchange, kc_symbol, notional_kc, kc_price)
+        # update best if improved
+        if new_diff < best[2]:
+            best = (notional_bin, notional_kc, new_diff)
+        else:
+            # if no improvement, break to avoid oscillation
+            break
+
+    # Final safety clamp within allowed bounds
+    notional_bin = max(min(best[0], max_allowed), min_allowed)
+    notional_kc = max(min(best[1], max_allowed), min_allowed)
+
+    return float(notional_bin), float(notional_kc)
+# -------------------------------------------------------------------
+
 def get_prices():
     bin_prices = {}
     kc_prices = {}
@@ -361,12 +454,10 @@ def get_prices():
             kc_prices[raw_id]=(float(d.get('bestBidPrice','0') or 0),float(d.get('bestAskPrice','0') or 0))
     except: pass
     return bin_prices,kc_prices
-
 # Starting balance
 start_total_balance, start_bin_balance, start_kc_balance = get_total_futures_balance()
 print(f"Starting total balance approx: ${start_total_balance:.2f} (Binance: ${start_bin_balance:.2f} | KuCoin: ${start_kc_balance:.2f})\n")
 print(f"{datetime.now()} BOT STARTED – monitoring {SYMBOLS} / {KUCOIN_SYMBOLS}\n")
-
 while True:
     try:
         bin_prices,kc_prices = get_prices()
@@ -375,7 +466,7 @@ while True:
             kc_bid,kc_ask = kc_prices.get(KUCOIN_SYMBOLS[i],(None,None))
             kc_trade_sym = KUCOIN_TRADE_SYMBOLS[i]
             if None in (bin_bid,bin_ask,kc_bid,kc_ask) or not kc_trade_sym: continue
-          
+         
             # Reset confirmation counters if spread condition breaks
             if bin_ask < kc_bid:
                 trigger_spread = 100*(kc_bid - bin_ask)/bin_ask
@@ -385,7 +476,6 @@ while True:
                 trigger_spread = 100*(bin_bid - kc_ask)/kc_ask
                 if trigger_spread < ENTRY_SPREAD:
                     entry_confirm_count[sym] = 0
-
             # CASE A: Binance ask < KuCoin bid (Buy Binance, Sell KuCoin)
             if bin_ask < kc_bid:
                 trigger_spread = 100*(kc_bid - bin_ask)/bin_ask
@@ -399,23 +489,23 @@ while True:
                         entry_actual[sym]['trigger_time'] = trigger_time
                         entry_actual[sym]['trigger_price'] = {'binance':bin_ask,'kucoin':kc_bid}
                         print(f"{trigger_time.strftime('%H:%M:%S.%f')[:-3]} ENTRY CASE A CONFIRMED 3/3 -> EXECUTING PARALLEL ORDERS")
-                        
+                       
                         # PARALLEL ORDER EXECUTION
+                        # ---------- NEW: compute matched notionals ----------
+                        notional_bin, notional_kc = match_notional_per_exchange(binance, kucoin, sym, kc_trade_sym, NOTIONAL, bin_ask, kc_bid)
+                        # Execute with per-exchange notionals
                         results = {}
-                        def exec_kc(): results['kc'] = safe_create_order(kucoin,'sell',NOTIONAL,kc_bid,kc_trade_sym, trigger_time=trigger_time, trigger_price=kc_bid)
-                        def exec_bin(): results['bin'] = safe_create_order(binance,'buy',NOTIONAL,bin_ask,sym, trigger_time=trigger_time, trigger_price=bin_ask)
+                        def exec_kc(): results['kc'] = safe_create_order(kucoin,'sell',notional_kc,kc_bid,kc_trade_sym, trigger_time=trigger_time, trigger_price=kc_bid)
+                        def exec_bin(): results['bin'] = safe_create_order(binance,'buy',notional_bin,bin_ask,sym, trigger_time=trigger_time, trigger_price=bin_ask)
                         t1 = threading.Thread(target=exec_kc)
                         t2 = threading.Thread(target=exec_bin)
                         t1.start(); t2.start(); t1.join(); t2.join()
-
                         ok_kc, exec_price_kc, exec_time_kc = results.get('kc', (False,None,None))
                         ok_bin, exec_price_bin, exec_time_bin = results.get('bin', (False,None,None))
-
                         if ok_kc and ok_bin and exec_price_kc is not None and exec_price_bin is not None:
                             real_entry_spread = 100 * (exec_price_kc - exec_price_bin) / exec_price_bin
                             final_entry_spread = trigger_spread if real_entry_spread >= trigger_spread else real_entry_spread
                             print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Spread: Real({real_entry_spread:.3f}%) {'≥' if real_entry_spread >= trigger_spread else '<'} Trigger({trigger_spread:.3f}%). Using {'Trigger' if real_entry_spread >= trigger_spread else 'Real'} Spread as profit basis.")
-
                             entry_prices[sym]['kucoin'] = exec_price_kc
                             entry_prices[sym]['binance'] = exec_price_bin
                             entry_actual[sym]['kucoin'] = {'exec_price': exec_price_kc, 'exec_time': exec_time_kc}
@@ -423,8 +513,7 @@ while True:
                             entry_spreads[sym] = final_entry_spread
                             positions[sym]='caseA'
                             trade_start_balances[sym]=start_total_balance
-                            entry_confirm_count[sym] = 0  # Reset after entry
-
+                            entry_confirm_count[sym] = 0 # Reset after entry
                             sl_kc = exec_price_kc - kc_bid
                             sl_bin = exec_price_bin - bin_ask
                             lat_kc = lat_bin = None
@@ -433,7 +522,13 @@ while True:
                                 if exec_time_kc: lat_kc = int(datetime.fromisoformat(exec_time_kc.replace('Z','')).timestamp()*1000) - t0_ms
                                 if exec_time_bin: lat_bin = int(datetime.fromisoformat(exec_time_bin.replace('Z','')).timestamp()*1000) - t0_ms
                             except: pass
-
+                            # Print matched-notional debug summary
+                            try:
+                                implied_bin = compute_amount_for_notional(binance, sym, notional_bin, exec_price_bin)[1]
+                                implied_kc = compute_amount_for_notional(kucoin, kc_trade_sym, notional_kc, exec_price_kc)[1]
+                                print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} MATCHED NOTIONALS | bin_notional=${notional_bin:.6f} implied=${implied_bin:.8f} | kc_notional=${notional_kc:.6f} implied=${implied_kc:.8f}")
+                            except Exception:
+                                pass
                             print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} ENTRY SUMMARY | trigger_time={trigger_time.strftime('%H:%M:%S.%f')[:-3]} | trigger_prices bin:{bin_ask} kc:{kc_bid}")
                             print(f" KuCoin executed: price={exec_price_kc} exec_time={exec_time_kc} slippage={sl_kc:.8f} latency_ms={lat_kc}")
                             print(f" Binance executed: price={exec_price_bin} exec_time={exec_time_bin} slippage={sl_bin:.8f} latency_ms={lat_bin}")
@@ -446,7 +541,6 @@ while True:
                 else:
                     if entry_confirm_count[sym] > 0 and entry_confirm_count[sym] < 3:
                         print(f"{datetime.now().strftime('%H:%M:%S')} → Entry confirmation {entry_confirm_count[sym]}/3 for CASE A")
-
             # CASE B: Binance bid > KuCoin ask (Sell Binance, Buy KuCoin)
             elif bin_bid > kc_ask:
                 trigger_spread = 100*(bin_bid - kc_ask)/kc_ask
@@ -460,22 +554,20 @@ while True:
                         entry_actual[sym]['trigger_time'] = trigger_time
                         entry_actual[sym]['trigger_price'] = {'binance':bin_bid,'kucoin':kc_ask}
                         print(f"{trigger_time.strftime('%H:%M:%S.%f')[:-3]} ENTRY CASE B CONFIRMED 3/3 -> EXECUTING PARALLEL ORDERS")
-
+                        # ---------- NEW: compute matched notionals ----------
+                        notional_bin, notional_kc = match_notional_per_exchange(binance, kucoin, sym, kc_trade_sym, NOTIONAL, bin_bid, kc_ask)
                         results = {}
-                        def exec_kc(): results['kc'] = safe_create_order(kucoin,'buy',NOTIONAL,kc_ask,kc_trade_sym, trigger_time=trigger_time, trigger_price=kc_ask)
-                        def exec_bin(): results['bin'] = safe_create_order(binance,'sell',NOTIONAL,bin_bid,sym, trigger_time=trigger_time, trigger_price=bin_bid)
+                        def exec_kc(): results['kc'] = safe_create_order(kucoin,'buy',notional_kc,kc_ask,kc_trade_sym, trigger_time=trigger_time, trigger_price=kc_ask)
+                        def exec_bin(): results['bin'] = safe_create_order(binance,'sell',notional_bin,bin_bid,sym, trigger_time=trigger_time, trigger_price=bin_bid)
                         t1 = threading.Thread(target=exec_kc)
                         t2 = threading.Thread(target=exec_bin)
                         t1.start(); t2.start(); t1.join(); t2.join()
-
                         ok_kc, exec_price_kc, exec_time_kc = results.get('kc', (False,None,None))
                         ok_bin, exec_price_bin, exec_time_bin = results.get('bin', (False,None,None))
-
                         if ok_kc and ok_bin and exec_price_kc is not None and exec_price_bin is not None:
                             real_entry_spread = 100 * (exec_price_bin - exec_price_kc) / exec_price_kc
                             final_entry_spread = trigger_spread if real_entry_spread >= trigger_spread else real_entry_spread
                             print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Spread: Real({real_entry_spread:.3f}%) {'≥' if real_entry_spread >= trigger_spread else '<'} Trigger({trigger_spread:.3f}%). Using {'Trigger' if real_entry_spread >= trigger_spread else 'Real'} Spread as profit basis.")
-
                             entry_prices[sym]['kucoin'] = exec_price_kc
                             entry_prices[sym]['binance'] = exec_price_bin
                             entry_actual[sym]['kucoin'] = {'exec_price': exec_price_kc, 'exec_time': exec_time_kc}
@@ -484,7 +576,6 @@ while True:
                             positions[sym]='caseB'
                             trade_start_balances[sym]=start_total_balance
                             entry_confirm_count[sym] = 0
-
                             sl_kc = exec_price_kc - kc_ask
                             sl_bin = exec_price_bin - bin_bid
                             lat_kc = lat_bin = None
@@ -493,7 +584,13 @@ while True:
                                 if exec_time_kc: lat_kc = int(datetime.fromisoformat(exec_time_kc.replace('Z','')).timestamp()*1000) - t0_ms
                                 if exec_time_bin: lat_bin = int(datetime.fromisoformat(exec_time_bin.replace('Z','')).timestamp()*1000) - t0_ms
                             except: pass
-
+                            # Print matched-notional debug summary
+                            try:
+                                implied_bin = compute_amount_for_notional(binance, sym, notional_bin, exec_price_bin)[1]
+                                implied_kc = compute_amount_for_notional(kucoin, kc_trade_sym, notional_kc, exec_price_kc)[1]
+                                print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} MATCHED NOTIONALS | bin_notional=${notional_bin:.6f} implied=${implied_bin:.8f} | kc_notional=${notional_kc:.6f} implied=${implied_kc:.8f}")
+                            except Exception:
+                                pass
                             print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} ENTRY SUMMARY | trigger_time={trigger_time.strftime('%H:%M:%S.%f')[:-3]} | trigger_prices bin:{bin_bid} kc:{kc_ask}")
                             print(f" KuCoin executed: price={exec_price_kc} exec_time={exec_time_kc} slippage={sl_kc:.8f} latency_ms={lat_kc}")
                             print(f" Binance executed: price={exec_price_bin} exec_time={exec_time_bin} slippage={sl_bin:.8f} latency_ms={lat_bin}")
@@ -505,7 +602,6 @@ while True:
                     else:
                         if entry_confirm_count[sym] > 0 and entry_confirm_count[sym] < 3:
                             print(f"{datetime.now().strftime('%H:%M:%S')} → Entry confirmation {entry_confirm_count[sym]}/3 for CASE B")
-
             # EXIT logic with 3x confirmation
             if positions[sym] is not None:
                 if positions[sym]=='caseA':
@@ -516,9 +612,8 @@ while True:
                     current_exit_spread = 100*(bin_bid - kc_ask)/entry_prices[sym]['kucoin']
                     captured = current_exit_spread - entry_spreads[sym]
                     current_entry_spread = 100*(bin_bid - kc_ask)/kc_ask
-                  
+                 
                 print(f"{datetime.now().strftime('%H:%M:%S')} POSITION OPEN | Entry Spread (Trigger): {current_entry_spread:.3f}% | Entry Basis: {entry_spreads[sym]:.3f}% | Exit Spread: {current_exit_spread:.3f}% | Captured: {captured:.3f}% | Exit Confirm: {exit_confirm_count[sym] + (1 if (captured >= PROFIT_TARGET or abs(current_exit_spread)<0.02) else 0)}/3")
-
                 exit_condition = captured >= PROFIT_TARGET or abs(current_exit_spread) < 0.02
                 if exit_condition:
                     exit_confirm_count[sym] += 1
@@ -536,8 +631,7 @@ while True:
                     else:
                         print(f"{datetime.now().strftime('%H:%M:%S')} → Exit condition met, confirming {exit_confirm_count[sym]}/3...")
                 else:
-                    exit_confirm_count[sym] = 0  # Reset if condition breaks
-
+                    exit_confirm_count[sym] = 0 # Reset if condition breaks
         time.sleep(0.1)
     except KeyboardInterrupt:
         print("Stopping bot...")
@@ -546,4 +640,3 @@ while True:
     except Exception as e:
         print("ERROR:",e)
         time.sleep(0.5)
-
