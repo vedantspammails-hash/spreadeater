@@ -17,7 +17,7 @@ SYMBOLS = ["TRUSTUSDT"]
 KUCOIN_SYMBOLS = ["TRUSTUSDTM"]
 NOTIONAL = 10.0
 LEVERAGE = 6
-ENTRY_SPREAD = 3.0
+ENTRY_SPREAD = 2.0
 PROFIT_TARGET = 0.6
 MARGIN_BUFFER = 1.02
 print(f"\n{'='*72}")
@@ -546,3 +546,4 @@ while True:
     except Exception as e:
         print("ERROR:",e)
         time.sleep(0.5)
+
