@@ -13,7 +13,7 @@ if missing:
     print(f"ERROR: Missing .env keys: {', '.join(missing)}")
     sys.exit(1)
 # CONFIG
-SYMBOLS = [SUPERUSDT"]
+SYMBOLS = ["SUPERUSDT"]
 KUCOIN_SYMBOLS = ["SUPERUSDTM"]
 NOTIONAL = 100.0
 LEVERAGE = 5
@@ -620,6 +620,7 @@ while True:
     except Exception as e:
         print("ERROR:",e)
         time.sleep(0.5)
+
 
 
 
