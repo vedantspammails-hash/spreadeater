@@ -13,12 +13,12 @@ if missing:
     print(f"ERROR: Missing .env keys: {', '.join(missing)}")
     sys.exit(1)
 # CONFIG
-SYMBOLS = ["SUPERUSDT"]
-KUCOIN_SYMBOLS = ["SUPERUSDTM"]
+SYMBOLS = ["TRUSTUSDT"]
+KUCOIN_SYMBOLS = ["TRUSTUSDTM"]
 NOTIONAL = 100.0
 LEVERAGE = 5
-ENTRY_SPREAD = 3.5
-PROFIT_TARGET = 2.0
+ENTRY_SPREAD = 2.1
+PROFIT_TARGET = 0.7
 MARGIN_BUFFER = 1.02
 print(f"\n{'='*72}")
 print(f"SINGLE COIN 4x LIVE ARB BOT | NOTIONAL ${NOTIONAL} @ {LEVERAGE}x | ENTRY >= {ENTRY_SPREAD}% | PROFIT TARGET {PROFIT_TARGET}%")
@@ -620,6 +620,7 @@ while True:
     except Exception as e:
         print("ERROR:",e)
         time.sleep(0.5)
+
 
 
 
