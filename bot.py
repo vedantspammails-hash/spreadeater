@@ -16,7 +16,7 @@ if missing:
 # CONFIG
 SYMBOLS = ["TNSRUSDT"]
 KUCOIN_SYMBOLS = ["TNSRUSDTM"]
-NOTIONAL = 50.0
+NOTIONAL = 30.0
 LEVERAGE = 30
 ENTRY_SPREAD = 1.4
 PROFIT_TARGET = 0.4
@@ -644,4 +644,5 @@ while True:
     except Exception as e:
         print("ERROR:",e)
         time.sleep(0.5)
+
 
