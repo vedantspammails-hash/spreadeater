@@ -6,7 +6,6 @@ from datetime import datetime
 from dotenv import load_dotenv
 import ccxt
 import threading # NEW: for parallel order execution
-import random
 load_dotenv()
 REQUIRED = ['BINANCE_API_KEY','BINANCE_API_SECRET','KUCOIN_API_KEY','KUCOIN_API_SECRET','KUCOIN_API_PASSPHRASE']
 missing = [k for k in REQUIRED if not os.getenv(k)]
@@ -14,14 +13,13 @@ if missing:
     print(f"ERROR: Missing .env keys: {', '.join(missing)}")
     sys.exit(1)
 # CONFIG
-SYMBOLS = ["SOONUSDT"]
-KUCOIN_SYMBOLS = ["SOONUSDTM"]
-NOTIONAL = 50.0
-LEVERAGE = 50
-ENTRY_SPREAD = 0.5
-PROFIT_TARGET = 0.3
+SYMBOLS = ["TOSHIUSDT"]
+KUCOIN_SYMBOLS = ["TOSHIUSDTM"]
+NOTIONAL = 200.0
+LEVERAGE = 10
+ENTRY_SPREAD = 0.8
+PROFIT_TARGET = 0.4
 MARGIN_BUFFER = 1.02
-LIQUIDATION_GRACE_SECONDS = 10.0
 print(f"\n{'='*72}")
 print(f"SINGLE COIN 4x LIVE ARB BOT | NOTIONAL ${NOTIONAL} @ {LEVERAGE}x | ENTRY >= {ENTRY_SPREAD}% | PROFIT TARGET {PROFIT_TARGET}%")
 print(f"Tracking symbol: {SYMBOLS[0]}")
@@ -434,31 +432,10 @@ def get_prices():
 start_total_balance, start_bin_balance, start_kc_balance = get_total_futures_balance()
 print(f"Starting total balance approx: ${start_total_balance:.2f} (Binance: ${start_bin_balance:.2f} | KuCoin: ${start_kc_balance:.2f})\n")
 print(f"{datetime.now()} BOT STARTED – monitoring {SYMBOLS} / {KUCOIN_SYMBOLS}\n")
-# --- LIQUIDATION PROTECTION GLOBALS ---
-entry_timestamp = {s: 0.0 for s in SYMBOLS}
-last_liq_check   = {s: 0.0 for s in SYMBOLS}
 while True:
     try:
         bin_prices,kc_prices = get_prices()
-
         for i,sym in enumerate(SYMBOLS):
-            # LIQUIDATION PROTECTION: check for skewed one-sided fills and close if detected
-            if positions[sym] is not None and not closing_in_progress:
-                since = time.time() - entry_timestamp.get(sym, 0)
-                if since < LIQUIDATION_GRACE_SECONDS:  # grace period from config
-                    pass
-                elif time.time() - last_liq_check[sym] > 1.5:
-                    try:
-                        bin_amt = abs(float(binance.fetch_positions([sym])[0].get('positionAmt') or 0))
-                        kc_qty  = abs(float((kucoin.fetch_positions([KUCOIN_TRADE_SYMBOLS[i]])[0].get('info',{}).get('currentQty') or 0)))
-                        if (bin_amt < 1 and kc_qty >= 5) or (kc_qty < 1 and bin_amt >= 5):
-                            print(f"LIQUIDATION DETECTED! Closing remaining side ({since:.1f}s after entry)")
-                            closing_in_progress = True
-                            close_all_and_wait()
-                            positions[sym] = None
-                    except: pass
-                    last_liq_check[sym] = time.time()
-
             bin_bid,bin_ask = bin_prices.get(sym,(None,None))
             kc_bid,kc_ask = kc_prices.get(KUCOIN_SYMBOLS[i],(None,None))
             kc_trade_sym = KUCOIN_TRADE_SYMBOLS[i]
@@ -511,7 +488,6 @@ while True:
                             entry_actual[sym]['binance'] = {'exec_price': exec_price_bin, 'exec_time': exec_time_bin}
                             entry_spreads[sym] = final_entry_spread
                             positions[sym]='caseA'
-                            entry_timestamp[sym] = time.time()
                             trade_start_balances[sym]=start_total_balance
                             entry_confirm_count[sym] = 0 # Reset after entry
                             sl_kc = exec_price_kc - kc_bid
@@ -577,7 +553,6 @@ while True:
                             entry_actual[sym]['binance'] = {'exec_price': exec_price_bin, 'exec_time': exec_time_bin}
                             entry_spreads[sym] = final_entry_spread
                             positions[sym]='caseB'
-                            entry_timestamp[sym] = time.time()
                             trade_start_balances[sym]=start_total_balance
                             entry_confirm_count[sym] = 0
                             sl_kc = exec_price_kc - kc_ask
@@ -637,7 +612,7 @@ while True:
                         print(f"{datetime.now().strftime('%H:%M:%S')} → Exit condition met, confirming {exit_confirm_count[sym]}/3...")
                 else:
                     exit_confirm_count[sym] = 0 # Reset if condition breaks
-        time.sleep(0.075 + random.uniform(0, 0.015))
+        time.sleep(0.1)
     except KeyboardInterrupt:
         print("Stopping bot...")
         close_all_and_wait()
@@ -645,3 +620,21 @@ while True:
     except Exception as e:
         print("ERROR:",e)
         time.sleep(0.5)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
