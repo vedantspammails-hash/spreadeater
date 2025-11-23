@@ -6,6 +6,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 import ccxt
 import threading # NEW: for parallel order execution
+import random
 load_dotenv()
 REQUIRED = ['BINANCE_API_KEY','BINANCE_API_SECRET','KUCOIN_API_KEY','KUCOIN_API_SECRET','KUCOIN_API_PASSPHRASE']
 missing = [k for k in REQUIRED if not os.getenv(k)]
@@ -13,13 +14,14 @@ if missing:
     print(f"ERROR: Missing .env keys: {', '.join(missing)}")
     sys.exit(1)
 # CONFIG
-SYMBOLS = ["TRUSTUSDT"]
-KUCOIN_SYMBOLS = ["TRUSTUSDTM"]
+SYMBOLS = ["TNSRUSDT"]
+KUCOIN_SYMBOLS = ["TNSRUSDTM"]
 NOTIONAL = 50.0
 LEVERAGE = 50
-ENTRY_SPREAD = 1.0
+ENTRY_SPREAD = 1.4
 PROFIT_TARGET = 0.4
 MARGIN_BUFFER = 1.02
+LIQUIDATION_GRACE_SECONDS = 10.0
 print(f"\n{'='*72}")
 print(f"SINGLE COIN 4x LIVE ARB BOT | NOTIONAL ${NOTIONAL} @ {LEVERAGE}x | ENTRY >= {ENTRY_SPREAD}% | PROFIT TARGET {PROFIT_TARGET}%")
 print(f"Tracking symbol: {SYMBOLS[0]}")
@@ -54,7 +56,7 @@ def ensure_markets_loaded():
         try: ex.load_markets(reload=False)
         except:
             try: ex.load_markets(reload=True)
-            except: pass  # Changed from 'entry_spreads' which seemed like a typo
+            except: entry_spreads
 def get_market(exchange,symbol):
     ensure_markets_loaded()
     m = exchange.markets.get(symbol)
@@ -123,8 +125,6 @@ entry_actual = {s:{'binance':None,'kucoin':None,'trigger_time':None,'trigger_pri
 # --- CONFIRMATION COUNTERS (NEW) ---
 entry_confirm_count = {s: 0 for s in SYMBOLS}
 exit_confirm_count = {s: 0 for s in SYMBOLS}
-# NEW: LIQUIDATION PROTECTION - Track last check time to avoid rate limits
-last_liq_check = {s: 0 for s in SYMBOLS}
 # --- NEW: Get Total Futures Balance in USDT ---
 def get_total_futures_balance():
     try:
@@ -175,6 +175,7 @@ def close_all_and_wait(timeout_s=20,poll_interval=0.5):
     print("\n" + "="*72)
     print("Closing all positions...")
     print("="*72)
+ 
     for sym in SYMBOLS:
         try:
             positions_bin = binance.fetch_positions([sym])
@@ -337,6 +338,7 @@ def safe_create_order(exchange,side,notional,price,symbol, trigger_time=None, tr
     except Exception as e:
         print(f"{exchange.id.upper()} order failed: {e}")
         return False, None, None
+
 # -------------------- NEW: match exposure by BASE TOKEN --------------------
 def match_base_exposure_per_exchange(bin_exchange, kc_exchange, bin_symbol, kc_symbol, desired_usdt, bin_price, kc_price):
     """
@@ -365,26 +367,32 @@ def match_base_exposure_per_exchange(bin_exchange, kc_exchange, bin_symbol, kc_s
             if isinstance(prec, dict): kc_prec = prec.get('amount')
             kc_contract_size = float(m_kc.get('contractSize') or m_kc.get('info', {}).get('contractSize') or 1.0)
     except: pass
+
     # Reference price: average of the two trigger prices (less bias)
     try:
         ref_price = (float(bin_price) + float(kc_price)) / 2.0
         if ref_price <= 0: ref_price = float(bin_price) or float(kc_price) or 1.0
     except:
         ref_price = float(bin_price) or float(kc_price) or 1.0
+
     # Convert desired_usdt -> target base token amount
     target_base = desired_usdt / ref_price
+
     # Now round target_base to each exchange's allowed representation
     # Binance wants base tokens (amount)
     bin_base_amount = round_down(target_base, bin_prec) if bin_prec is not None else target_base
+
     # KuCoin wants contracts: contracts = base_amount / contract_size
     kc_contracts = 0.0
     if kc_contract_size and kc_contract_size > 0:
         kc_contracts = round_down(target_base / kc_contract_size, kc_prec) if kc_prec is not None else (target_base / kc_contract_size)
     else:
         kc_contracts = round_down(target_base, kc_prec) if kc_prec is not None else target_base
+
     # Convert back to per-exchange notionals using trigger prices (these are the notional values passed to safe_create_order)
     notional_bin = bin_base_amount * float(bin_price)
     notional_kc = kc_contracts * float(kc_contract_size) * float(kc_price)
+
     # final safety: if rounding produced zero on either side, fallback to small positive amount
     if bin_base_amount <= 0:
         # compute minimal positive amount (one step)
@@ -401,8 +409,11 @@ def match_base_exposure_per_exchange(bin_exchange, kc_exchange, bin_symbol, kc_s
         else:
             kc_contracts = (step_kc / kc_contract_size) if kc_contract_size else step_kc
         notional_kc = kc_contracts * float(kc_contract_size) * float(kc_price)
+
     return float(notional_bin), float(notional_kc), float(bin_base_amount), float(kc_contracts)
+
 # -------------------------------------------------------------------
+
 def get_prices():
     bin_prices = {}
     kc_prices = {}
@@ -423,34 +434,35 @@ def get_prices():
 start_total_balance, start_bin_balance, start_kc_balance = get_total_futures_balance()
 print(f"Starting total balance approx: ${start_total_balance:.2f} (Binance: ${start_bin_balance:.2f} | KuCoin: ${start_kc_balance:.2f})\n")
 print(f"{datetime.now()} BOT STARTED – monitoring {SYMBOLS} / {KUCOIN_SYMBOLS}\n")
+# --- LIQUIDATION PROTECTION GLOBALS ---
+entry_timestamp = {s: 0.0 for s in SYMBOLS}
+last_liq_check   = {s: 0.0 for s in SYMBOLS}
 while True:
     try:
         bin_prices,kc_prices = get_prices()
+        # LIQUIDATION PROTECTION: check for skewed one-sided fills and close if detected
+        if positions[sym] is not None and not closing_in_progress:
+            since = time.time() - entry_timestamp.get(sym, 0)
+            if since < 10.0:  # 10-second grace period
+                pass
+            elif time.time() - last_liq_check[sym] > 1.5:
+                try:
+                    bin_amt = abs(float(binance.fetch_positions([sym])[0].get('positionAmt') or 0))
+                    kc_qty  = abs(float((kucoin.fetch_positions([KUCOIN_TRADE_SYMBOLS[i]])[0].get('info',{}).get('currentQty') or 0)))
+                    if (bin_amt < 1 and kc_qty >= 5) or (kc_qty < 1 and bin_amt >= 5):
+                        print(f"LIQUIDATION DETECTED! Closing remaining side ({since:.1f}s after entry)")
+                        closing_in_progress = True
+                        close_all_and_wait()
+                        positions[sym] = None
+                except: pass
+                last_liq_check[sym] = time.time()
+
         for i,sym in enumerate(SYMBOLS):
             bin_bid,bin_ask = bin_prices.get(sym,(None,None))
             kc_bid,kc_ask = kc_prices.get(KUCOIN_SYMBOLS[i],(None,None))
             kc_trade_sym = KUCOIN_TRADE_SYMBOLS[i]
             if None in (bin_bid,bin_ask,kc_bid,kc_ask) or not kc_trade_sym: continue
-        
-            # NEW: LIQUIDATION PROTECTION - Check for liquidation if position open
-            if positions[sym] is not None and not closing_in_progress:
-                if time.time() - last_liq_check[sym] > 1:  # Check every 1s to avoid rate limits
-                    try:
-                        bin_pos = binance.fetch_positions([sym])
-                        bin_amt = float(bin_pos[0].get('positionAmt') or 0) if bin_pos else 0
-                        kc_pos = kucoin.fetch_positions([kc_trade_sym])
-                        kc_qty = float((kc_pos[0].get('info') or {}).get('currentQty') or 0) if kc_pos else 0
-                        if (abs(bin_amt) == 0 and abs(kc_qty) > 0) or (abs(kc_qty) == 0 and abs(bin_amt) > 0):
-                            print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} LIQUIDATION DETECTED for {sym}! One side closed unexpectedly. Closing remaining positions.")
-                            closing_in_progress = True
-                            close_all_and_wait()
-                            positions[sym] = None
-                            exit_confirm_count[sym] = 0
-                            entry_confirm_count[sym] = 0
-                    except Exception as e:
-                        print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Error checking liquidation for {sym}: {e} (assuming no liquidation)")
-                    last_liq_check[sym] = time.time()
-        
+         
             # Reset confirmation counters if spread condition breaks
             if bin_ask < kc_bid:
                 trigger_spread = 100*(kc_bid - bin_ask)/bin_ask
@@ -473,7 +485,7 @@ while True:
                         entry_actual[sym]['trigger_time'] = trigger_time
                         entry_actual[sym]['trigger_price'] = {'binance':bin_ask,'kucoin':kc_bid}
                         print(f"{trigger_time.strftime('%H:%M:%S.%f')[:-3]} ENTRY CASE A CONFIRMED 3/3 -> EXECUTING PARALLEL ORDERS")
-                      
+                       
                         # PARALLEL ORDER EXECUTION
                         # ---------- NEW: compute matched base-token exposure ----------
                         notional_bin, notional_kc, bin_base_amt, kc_contracts = match_base_exposure_per_exchange(
@@ -498,6 +510,7 @@ while True:
                             entry_actual[sym]['binance'] = {'exec_price': exec_price_bin, 'exec_time': exec_time_bin}
                             entry_spreads[sym] = final_entry_spread
                             positions[sym]='caseA'
+                            entry_timestamp[sym] = time.time()
                             trade_start_balances[sym]=start_total_balance
                             entry_confirm_count[sym] = 0 # Reset after entry
                             sl_kc = exec_price_kc - kc_bid
@@ -563,6 +576,7 @@ while True:
                             entry_actual[sym]['binance'] = {'exec_price': exec_price_bin, 'exec_time': exec_time_bin}
                             entry_spreads[sym] = final_entry_spread
                             positions[sym]='caseB'
+                            entry_timestamp[sym] = time.time()
                             trade_start_balances[sym]=start_total_balance
                             entry_confirm_count[sym] = 0
                             sl_kc = exec_price_kc - kc_ask
@@ -602,7 +616,7 @@ while True:
                     current_exit_spread = 100*(bin_bid - kc_ask)/entry_prices[sym]['kucoin']
                     captured = current_exit_spread - entry_spreads[sym]
                     current_entry_spread = 100*(bin_bid - kc_ask)/kc_ask
-                
+                 
                 print(f"{datetime.now().strftime('%H:%M:%S')} POSITION OPEN | Entry Spread (Trigger): {current_entry_spread:.3f}% | Entry Basis: {entry_spreads[sym]:.3f}% | Exit Spread: {current_exit_spread:.3f}% | Captured: {captured:.3f}% | Exit Confirm: {exit_confirm_count[sym] + (1 if (captured >= PROFIT_TARGET or abs(current_exit_spread)<0.02) else 0)}/3")
                 exit_condition = captured >= PROFIT_TARGET or abs(current_exit_spread) < 0.02
                 if exit_condition:
@@ -622,7 +636,7 @@ while True:
                         print(f"{datetime.now().strftime('%H:%M:%S')} → Exit condition met, confirming {exit_confirm_count[sym]}/3...")
                 else:
                     exit_confirm_count[sym] = 0 # Reset if condition breaks
-        time.sleep(0.1)
+        time.sleep(0.075 + random.uniform(0, 0.015))
     except KeyboardInterrupt:
         print("Stopping bot...")
         close_all_and_wait()
@@ -630,4 +644,3 @@ while True:
     except Exception as e:
         print("ERROR:",e)
         time.sleep(0.5)
-
