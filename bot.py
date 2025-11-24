@@ -17,8 +17,8 @@ SYMBOLS = ["AIAUSDT"]
 KUCOIN_SYMBOLS = ["AIAUSDTM"]
 NOTIONAL = 25.0
 LEVERAGE = 5
-ENTRY_SPREAD = 1.8
-PROFIT_TARGET = 0.7
+ENTRY_SPREAD = 1.5
+PROFIT_TARGET = 0.6
 MARGIN_BUFFER = 1.02
 print(f"\n{'='*72}")
 print(f"SINGLE COIN 4x LIVE ARB BOT | NOTIONAL ${NOTIONAL} @ {LEVERAGE}x | ENTRY >= {ENTRY_SPREAD}% | PROFIT TARGET {PROFIT_TARGET}%")
@@ -620,6 +620,7 @@ while True:
     except Exception as e:
         print("ERROR:",e)
         time.sleep(0.5)
+
 
 
 
