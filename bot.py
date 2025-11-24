@@ -19,7 +19,7 @@ SYMBOLS = ["TRADOORUSDT"]
 KUCOIN_SYMBOLS = ["TRADOORUSDTM"]
 NOTIONAL = 10.0
 LEVERAGE = 5
-ENTRY_SPREAD = 0.9
+ENTRY_SPREAD = 0.7
 PROFIT_TARGET = 0.1
 MARGIN_BUFFER = 1.02
 print(f"\n{'='*72}")
@@ -678,3 +678,4 @@ while True:
     except Exception as e:
         print("ERROR:",e)
         time.sleep(0.5)
+
