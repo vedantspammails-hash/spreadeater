@@ -15,10 +15,10 @@ if missing:
 # CONFIG
 SYMBOLS = ["TNSRUSDT"]
 KUCOIN_SYMBOLS = ["TNSRUSDTM"]
-NOTIONAL = 150.0
+NOTIONAL = 100.0
 LEVERAGE = 4
-ENTRY_SPREAD = 6.0
-PROFIT_TARGET = 2.8
+ENTRY_SPREAD = 3.7
+PROFIT_TARGET = 1.5
 MARGIN_BUFFER = 1.02
 print(f"\n{'='*72}")
 print(f"SINGLE COIN 4x LIVE ARB BOT | NOTIONAL ${NOTIONAL} @ {LEVERAGE}x | ENTRY >= {ENTRY_SPREAD}% | PROFIT TARGET {PROFIT_TARGET}%")
@@ -620,6 +620,7 @@ while True:
     except Exception as e:
         print("ERROR:",e)
         time.sleep(0.5)
+
 
 
 
