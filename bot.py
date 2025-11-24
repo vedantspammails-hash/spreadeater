@@ -46,7 +46,7 @@ KUCOIN_ACTIVE_URL = "https://api-futures.kucoin.com/api/v1/contracts/active"
 KUCOIN_TICKER_URL = "https://api-futures.kucoin.com/api/v1/ticker?symbol={symbol}"
 
 # ------------------ Trading config (from user requirements) ------------------
-NOTIONAL = 100.0
+NOTIONAL = 50.0
 LEVERAGE = 5
 ENTRY_SPREAD = 5.0      # fixed 5% entry as required
 PROFIT_TARGET = 2.5     # 2.5% profit target
@@ -1029,3 +1029,4 @@ if __name__ == "__main__":
         logger.info("Interrupted by user, shutting down.")
     except Exception:
         logger.exception("Unhandled exception at top level")
+
