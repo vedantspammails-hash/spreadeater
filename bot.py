@@ -169,14 +169,14 @@ def has_open_positions():
                     pass
         return False
     except: return True
-# --- FIXED close_all_and_wait: robust Binance position detection + close using closePosition=True ---
+# --- FIXED close_all_and_wait: robust Binance position detection + multi-step close fallback ---
 def close_all_and_wait(timeout_s=20, poll_interval=0.5):
     global closing_in_progress
     print("\n" + "="*72)
     print("Closing all positions...")
     print("="*72)
 
-    # --- BINANCE: robust position detection and close using closePosition=True ---
+    # --- BINANCE: robust position detection and multi-step close ---
     for sym in SYMBOLS:
         try:
             positions_bin = binance.fetch_positions([sym])
@@ -185,7 +185,6 @@ def close_all_and_wait(timeout_s=20, poll_interval=0.5):
                 # Try multiple fields to determine signed quantity
                 raw_signed = 0.0
                 try:
-                    # common ccxt fields
                     cand = pos.get('positionAmt') if pos.get('positionAmt') is not None else pos.get('contracts')
                     if cand is not None:
                         raw_signed = float(cand)
@@ -195,7 +194,6 @@ def close_all_and_wait(timeout_s=20, poll_interval=0.5):
                 if abs(raw_signed) == 0:
                     try:
                         info = pos.get('info') or {}
-                        # Binance sometimes uses strings
                         for key in ('positionAmt', 'currentQty', 'size', 'qty', 'quantity'):
                             if key in info and info.get(key) not in (None, '', 0):
                                 try:
@@ -203,7 +201,6 @@ def close_all_and_wait(timeout_s=20, poll_interval=0.5):
                                     break
                                 except:
                                     pass
-                        # older ccxt / different endpoints might embed data under data
                         if abs(raw_signed) == 0 and isinstance(info.get('data'), dict):
                             idata = info.get('data') or {}
                             for key in ('positionAmt', 'currentQty', 'size', 'qty', 'quantity'):
@@ -215,8 +212,7 @@ def close_all_and_wait(timeout_s=20, poll_interval=0.5):
                                         pass
                     except Exception:
                         pass
-
-                # If still zero, try fallbacks from pos fields
+                # Fallback fields
                 if abs(raw_signed) == 0:
                     try:
                         raw_signed = float(pos.get('size') or pos.get('amount') or 0)
@@ -228,24 +224,65 @@ def close_all_and_wait(timeout_s=20, poll_interval=0.5):
 
                 if abs(raw_signed) > 0:
                     # Determine side to CLOSE the position:
-                    # - if raw_signed > 0 => we have a LONG => we should SELL to close
-                    # - if raw_signed < 0 => we have a SHORT => we should BUY to close
+                    # - if raw_signed > 0 => LONG => SELL to close
+                    # - if raw_signed < 0 => SHORT => BUY to close
                     side = 'sell' if raw_signed > 0 else 'buy'
-                    print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Closing Binance {sym} (detected {'LONG' if raw_signed>0 else 'SHORT'}) -> using side='{side}' with closePosition")
-                    # Try raw futures endpoint first to avoid ccxt param wrapping issues
-                    try:
-                        binance.fapiPrivate_post_order({
-                            'symbol': sym,
-                            'side': side.upper(),
-                            'type': 'MARKET',
-                            'closePosition': True
-                        })
-                    except Exception as e_raw:
-                        # fallback: use create_order with closePosition if raw fails
+                    print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Closing Binance {sym} (detected {'LONG' if raw_signed>0 else 'SHORT'}) -> using side='{side}'")
+
+                    # STEP 1: try raw Binance futures endpoint if available (avoids ccxt param wrapping)
+                    fapi_method = getattr(binance, 'fapiPrivate_post_order', None) or getattr(binance, 'fapiPrivatePostOrder', None)
+                    if callable(fapi_method):
                         try:
-                            binance.create_order(sym, 'market', side, None, None, params={'closePosition': True})
-                        except Exception as e_wrap:
-                            print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} BINANCE close failed (raw): {e_raw} ; fallback create_order failed: {e_wrap}")
+                            print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Trying raw fapi POST order (closePosition=True)...")
+                            fapi_method({
+                                'symbol': sym,
+                                'side': side.upper(),
+                                'type': 'MARKET',
+                                'closePosition': True
+                            })
+                            print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Raw fapi close requested.")
+                            # skip to next symbol (assume it will close)
+                            continue
+                        except Exception as e_raw:
+                            print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} raw fapi call failed: {e_raw}")
+
+                    # STEP 2: try ccxt create_order with closePosition param (may work on some ccxt versions)
+                    try:
+                        print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Trying ccxt.create_order with closePosition=True...")
+                        binance.create_order(sym, 'market', side, None, None, params={'closePosition': True})
+                        print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} create_order(closePosition) requested.")
+                        continue
+                    except Exception as e_closepos:
+                        print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} create_order(closePosition) failed: {e_closepos}")
+
+                    # STEP 3: fallback — compute exact qty from detected signed position and submit a market order with reduceOnly=True
+                    try:
+                        market = get_market(binance, sym)
+                        prec = None
+                        if market:
+                            prec = (market.get('precision') or {}).get('amount') if isinstance(market.get('precision'), dict) else None
+                        qty = round_down(abs(raw_signed), prec) if prec is not None else abs(raw_signed)
+                        if qty <= 0:
+                            # compute minimal sensible qty
+                            qty = round_down(abs(raw_signed) or 1.0, prec) if prec is not None else abs(raw_signed) or 1.0
+                        print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Fallback: placing market order qty={qty} params=reduceOnly to close Binance {sym}")
+                        # Use create_market_order helper if available, otherwise create_order
+                        try:
+                            # preferred: use create_market_buy_order / sell
+                            if side == 'buy':
+                                binance.create_market_buy_order(sym, qty, params={'reduceOnly': True})
+                            else:
+                                binance.create_market_sell_order(sym, qty, params={'reduceOnly': True})
+                            print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Fallback market close requested.")
+                        except Exception as e_market:
+                            # final fallback: generic create_order with quantity and reduceOnly
+                            try:
+                                binance.create_order(sym, 'market', side, qty, None, params={'reduceOnly': True})
+                                print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Fallback generic create_order requested.")
+                            except Exception as e_final:
+                                print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} All Binance close attempts failed: market err: {e_market} ; final err: {e_final}")
+                    except Exception as e_fb:
+                        print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Error computing fallback qty or sending fallback order: {e_fb}")
         except Exception as e:
             print(f"Binance close error for {sym}: {e}")
 
@@ -678,4 +715,3 @@ while True:
     except Exception as e:
         print("ERROR:",e)
         time.sleep(0.5)
-
