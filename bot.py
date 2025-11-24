@@ -19,7 +19,7 @@ SYMBOLS = ["TRADOORUSDT"]
 KUCOIN_SYMBOLS = ["TRADOORUSDTM"]
 NOTIONAL = 10.0
 LEVERAGE = 5
-ENTRY_SPREAD = 1.0
+ENTRY_SPREAD = 0.8
 PROFIT_TARGET = 0.1
 MARGIN_BUFFER = 1.02
 print(f"\n{'='*72}")
@@ -191,7 +191,7 @@ def close_all_and_wait(timeout_s=20,poll_interval=0.5):
                     try:
                         # ccxt supports creating a market order with closePosition param for Binance futures.
                         # amount is omitted (None) because closePosition=true will close the whole position and avoids size mismatch.
-                        binance.create_order(sym, 'market', side, None, None, params={'reduceOnly': True, 'closePosition': True})
+                        binance.create_order(sym, 'market', side, None, None, params={'closePosition': True})
                     except Exception as e:
                         print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} BINANCE close (closePosition) failed: {e}")
         except Exception as e:
@@ -624,5 +624,3 @@ while True:
     except Exception as e:
         print("ERROR:",e)
         time.sleep(0.5)
-
-
