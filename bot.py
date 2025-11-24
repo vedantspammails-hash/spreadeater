@@ -13,11 +13,11 @@ if missing:
     print(f"ERROR: Missing .env keys: {', '.join(missing)}")
     sys.exit(1)
 # CONFIG
-SYMBOLS = ["TNSRUSDT"]
-KUCOIN_SYMBOLS = ["TNSRUSDTM"]
+SYMBOLS = ["GPSUSDT"]
+KUCOIN_SYMBOLS = ["GPSUSDTM"]
 NOTIONAL = 100.0
-LEVERAGE = 4
-ENTRY_SPREAD = 3.7
+LEVERAGE = 5
+ENTRY_SPREAD = 3.5
 PROFIT_TARGET = 1.5
 MARGIN_BUFFER = 1.02
 print(f"\n{'='*72}")
@@ -620,6 +620,7 @@ while True:
     except Exception as e:
         print("ERROR:",e)
         time.sleep(0.5)
+
 
 
 
