@@ -13,12 +13,12 @@ if missing:
     print(f"ERROR: Missing .env keys: {', '.join(missing)}")
     sys.exit(1)
 # CONFIG
-SYMBOLS = ["AIAUSDT"]
-KUCOIN_SYMBOLS = ["AIAUSDTM"]
-NOTIONAL = 25.0
+SYMBOLS = ["TNSRUSDT"]
+KUCOIN_SYMBOLS = ["TNSRUSDTM"]
+NOTIONAL = 100.0
 LEVERAGE = 5
-ENTRY_SPREAD = 1.5
-PROFIT_TARGET = 0.6
+ENTRY_SPREAD = 3.5
+PROFIT_TARGET = 1.6
 MARGIN_BUFFER = 1.02
 print(f"\n{'='*72}")
 print(f"SINGLE COIN 4x LIVE ARB BOT | NOTIONAL ${NOTIONAL} @ {LEVERAGE}x | ENTRY >= {ENTRY_SPREAD}% | PROFIT TARGET {PROFIT_TARGET}%")
@@ -590,7 +590,7 @@ while True:
                     current_entry_spread = 100*(kc_bid - bin_ask)/bin_ask
                 elif positions[sym]=='caseB':
                     current_exit_spread = 100*(bin_bid - kc_ask)/entry_prices[sym]['kucoin']
-                    captured = current_exit_spread - entry_spreads[sym]
+                    captured = entry_spreads[sym] - current_exit_spread
                     current_entry_spread = 100*(bin_bid - kc_ask)/kc_ask
                  
                 print(f"{datetime.now().strftime('%H:%M:%S')} POSITION OPEN | Entry Spread (Trigger): {current_entry_spread:.3f}% | Entry Basis: {entry_spreads[sym]:.3f}% | Exit Spread: {current_exit_spread:.3f}% | Captured: {captured:.3f}% | Exit Confirm: {exit_confirm_count[sym] + (1 if (captured >= PROFIT_TARGET or abs(current_exit_spread)<0.02) else 0)}/3")
@@ -620,29 +620,3 @@ while True:
     except Exception as e:
         print("ERROR:",e)
         time.sleep(0.5)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
