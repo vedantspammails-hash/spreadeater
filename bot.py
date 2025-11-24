@@ -19,7 +19,7 @@ SYMBOLS = ["TRADOORUSDT"]
 KUCOIN_SYMBOLS = ["TRADOORUSDTM"]
 NOTIONAL = 10.0
 LEVERAGE = 5
-ENTRY_SPREAD = 0.8
+ENTRY_SPREAD = 0.9
 PROFIT_TARGET = 0.1
 MARGIN_BUFFER = 1.02
 print(f"\n{'='*72}")
@@ -169,33 +169,87 @@ def has_open_positions():
                     pass
         return False
     except: return True
-# --- FIXED close_all_and_wait: use authenticated ccxt.fetch_positions to get KuCoin positions ---
-def close_all_and_wait(timeout_s=20,poll_interval=0.5):
+# --- FIXED close_all_and_wait: robust Binance position detection + close using closePosition=True ---
+def close_all_and_wait(timeout_s=20, poll_interval=0.5):
     global closing_in_progress
     print("\n" + "="*72)
     print("Closing all positions...")
     print("="*72)
- 
+
+    # --- BINANCE: robust position detection and close using closePosition=True ---
     for sym in SYMBOLS:
         try:
             positions_bin = binance.fetch_positions([sym])
             if positions_bin:
-                raw = float(positions_bin[0].get('positionAmt') or positions_bin[0].get('contracts') or 0)
-                if abs(raw) > 0:
-                    side = 'sell' if raw > 0 else 'buy'
-                    market = get_market(binance, sym)
-                    prec = market.get('precision',{}).get('amount') if market else None
-                    qty = round_down(abs(raw), prec) if prec is not None else abs(raw)
-                    # --- REPLACED: use Binance official closePosition parameter which requires no quantity ---
-                    print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Closing Binance {sym} with closePosition param (side={side})")
+                pos = positions_bin[0]
+                # Try multiple fields to determine signed quantity
+                raw_signed = 0.0
+                try:
+                    # common ccxt fields
+                    cand = pos.get('positionAmt') if pos.get('positionAmt') is not None else pos.get('contracts')
+                    if cand is not None:
+                        raw_signed = float(cand)
+                except Exception:
+                    raw_signed = 0.0
+                # If still zero, inspect nested info dict for alternative keys
+                if abs(raw_signed) == 0:
                     try:
-                        # ccxt supports creating a market order with closePosition param for Binance futures.
-                        # amount is omitted (None) because closePosition=true will close the whole position and avoids size mismatch.
-                        binance.create_order(sym, 'market', side, None, None, params={'closePosition': True})
-                    except Exception as e:
-                        print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} BINANCE close (closePosition) failed: {e}")
+                        info = pos.get('info') or {}
+                        # Binance sometimes uses strings
+                        for key in ('positionAmt', 'currentQty', 'size', 'qty', 'quantity'):
+                            if key in info and info.get(key) not in (None, '', 0):
+                                try:
+                                    raw_signed = float(info.get(key))
+                                    break
+                                except:
+                                    pass
+                        # older ccxt / different endpoints might embed data under data
+                        if abs(raw_signed) == 0 and isinstance(info.get('data'), dict):
+                            idata = info.get('data') or {}
+                            for key in ('positionAmt', 'currentQty', 'size', 'qty', 'quantity'):
+                                if key in idata and idata.get(key) not in (None, '', 0):
+                                    try:
+                                        raw_signed = float(idata.get(key))
+                                        break
+                                    except:
+                                        pass
+                    except Exception:
+                        pass
+
+                # If still zero, try fallbacks from pos fields
+                if abs(raw_signed) == 0:
+                    try:
+                        raw_signed = float(pos.get('size') or pos.get('amount') or 0)
+                    except:
+                        raw_signed = 0.0
+
+                # DEBUG: print what we detected
+                print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Binance detected position for {sym}: raw_signed={raw_signed}")
+
+                if abs(raw_signed) > 0:
+                    # Determine side to CLOSE the position:
+                    # - if raw_signed > 0 => we have a LONG => we should SELL to close
+                    # - if raw_signed < 0 => we have a SHORT => we should BUY to close
+                    side = 'sell' if raw_signed > 0 else 'buy'
+                    print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Closing Binance {sym} (detected {'LONG' if raw_signed>0 else 'SHORT'}) -> using side='{side}' with closePosition")
+                    # Try raw futures endpoint first to avoid ccxt param wrapping issues
+                    try:
+                        binance.fapiPrivate_post_order({
+                            'symbol': sym,
+                            'side': side.upper(),
+                            'type': 'MARKET',
+                            'closePosition': True
+                        })
+                    except Exception as e_raw:
+                        # fallback: use create_order with closePosition if raw fails
+                        try:
+                            binance.create_order(sym, 'market', side, None, None, params={'closePosition': True})
+                        except Exception as e_wrap:
+                            print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} BINANCE close failed (raw): {e_raw} ; fallback create_order failed: {e_wrap}")
         except Exception as e:
             print(f"Binance close error for {sym}: {e}")
+
+    # --- KUCOIN: unchanged robust close logic ---
     all_kc_positions = []
     try:
         all_kc_positions = kucoin.fetch_positions(symbols=KUCOIN_TRADE_SYMBOLS)
