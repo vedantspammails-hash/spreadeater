@@ -18,7 +18,7 @@ SYMBOLS = ["AIAUSDT"]
 KUCOIN_SYMBOLS = ["AIAUSDTM"]
 NOTIONAL = 10.0
 LEVERAGE = 5
-ENTRY_SPREAD = 1.5
+ENTRY_SPREAD = 1.3
 PROFIT_TARGET = 0.1
 MARGIN_BUFFER = 1.02
 
@@ -599,4 +599,5 @@ while True:
     except Exception as e:
         print("ERROR:",e)
         time.sleep(0.5)
+
 
