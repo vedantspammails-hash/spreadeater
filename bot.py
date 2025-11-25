@@ -15,11 +15,11 @@ if missing:
     sys.exit(1)
 
 # CONFIG
-SYMBOLS = ["ICNTUSDT"]
-KUCOIN_SYMBOLS = ["ICNTUSDTM"]
+SYMBOLS = ["1000CHEEMSUSDT"]
+KUCOIN_SYMBOLS = ["1000CHEEMSUSDTM"]
 NOTIONAL = float(os.getenv('NOTIONAL', "50.0"))
 LEVERAGE = int(os.getenv('LEVERAGE', "5"))
-ENTRY_SPREAD = float(os.getenv('ENTRY_SPREAD', "2.5"))
+ENTRY_SPREAD = float(os.getenv('ENTRY_SPREAD', "0.9"))
 PROFIT_TARGET = float(os.getenv('PROFIT_TARGET', "0.5"))
 MARGIN_BUFFER = float(os.getenv('MARGIN_BUFFER', "1.02"))
 
@@ -1270,3 +1270,4 @@ while True:
     except Exception as e:
         print("ERROR:", e)
         time.sleep(0.5)
+
