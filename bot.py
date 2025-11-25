@@ -14,13 +14,17 @@ if missing:
     sys.exit(1)
 
 # CONFIG
-SYMBOLS = ["AIAUSDT"]
-KUCOIN_SYMBOLS = ["AIAUSDTM"]
-NOTIONAL = 10.0
-LEVERAGE = 5
-ENTRY_SPREAD = 1.0
-PROFIT_TARGET = 0.05
+SYMBOLS = ["ICNTUSDT"]
+KUCOIN_SYMBOLS = ["ICNTUSDTM"]
+NOTIONAL = 29.0
+LEVERAGE = 30
+ENTRY_SPREAD = 1.1
+PROFIT_TARGET = 0.4
 MARGIN_BUFFER = 1.02
+
+# Liquidation watcher config (tunable)
+WATCHER_POLL_INTERVAL = float(os.getenv('WATCHER_POLL_INTERVAL', "0.5"))  # seconds while watching an open pair
+WATCHER_DETECT_CONFIRM = int(os.getenv('WATCHER_DETECT_CONFIRM', "2"))    # consecutive confirms required to treat zero as liquidation
 
 print(f"\n{'='*72}")
 print(f"SINGLE COIN 4x LIVE ARB BOT | NOTIONAL ${NOTIONAL} @ {LEVERAGE}x | ENTRY >= {ENTRY_SPREAD}% | PROFIT TARGET {PROFIT_TARGET}%")
@@ -148,6 +152,12 @@ entry_prices = {s: {'binance': 0, 'kucoin': 0} for s in SYMBOLS}
 entry_actual = {s: {'binance': None, 'kucoin': None, 'trigger_time': None, 'trigger_price': None} for s in SYMBOLS}
 entry_confirm_count = {s: 0 for s in SYMBOLS}
 exit_confirm_count = {s: 0 for s in SYMBOLS}
+
+# Termination flag to stop main loop after a liquidation-close occurs
+terminate_bot = False
+
+# Track watcher threads to avoid starting duplicates
+_liquidation_watchers = {}
 
 # --- NEW: Get Total Futures Balance in USDT ---
 def get_total_futures_balance():
@@ -591,8 +601,153 @@ start_total_balance, start_bin_balance, start_kc_balance = get_total_futures_bal
 print(f"Starting total balance approx: ${start_total_balance:.2f} (Binance: ${start_bin_balance:.2f} | KuCoin: ${start_kc_balance:.2f})\n")
 print(f"{datetime.now()} BOT STARTED – monitoring {SYMBOLS} / {KUCOIN_SYMBOLS}\n")
 
+# -------------------- NEW: Integrated Liquidation Watcher --------------------
+def _fetch_signed_binance(sym):
+    try:
+        p = binance.fetch_positions([sym])
+        if not p:
+            return 0.0
+        pos = p[0]
+        return _get_signed_position_amount(pos)
+    except Exception as e:
+        print(f"{datetime.now().isoformat()} BINANCE fetch error for {sym}: {e}")
+        return None
+
+def _fetch_signed_kucoin(ccxt_sym):
+    try:
+        p = None
+        try:
+            p = kucoin.fetch_positions([ccxt_sym])
+        except Exception:
+            allp = kucoin.fetch_positions()
+            p = []
+            for pos in allp:
+                if pos.get('symbol') == ccxt_sym:
+                    p.append(pos)
+                    break
+        if not p:
+            return 0.0
+        pos = p[0]
+        return _get_signed_position_amount(pos)
+    except Exception as e:
+        print(f"{datetime.now().isoformat()} KUCOIN fetch error for {ccxt_sym}: {e}")
+        return None
+
+def _start_liquidation_watcher_for_symbol(sym, bin_sym, kc_sym):
+    """
+    Start a background thread that monitors the two positions for the given symbol pair.
+    It watches for non-zero -> zero transitions (confirmed) and then triggers close_all_and_wait().
+    Only starts once per sym (idempotent).
+    """
+    if _liquidation_watchers.get(sym):
+        return  # already running
+
+    stop_flag = threading.Event()
+    _liquidation_watchers[sym] = stop_flag
+
+    def monitor():
+        print(f"{datetime.now().isoformat()} Liquidation watcher STARTED for {sym} (bin:{bin_sym} kc:{kc_sym})")
+        # initialize previous sizes
+        prev_bin = None
+        prev_kc = None
+        confirm_bin = 0
+        confirm_kc = 0
+
+        # set initial prev values to current positions where possible
+        wb = _fetch_signed_binance(bin_sym)
+        wk = _fetch_signed_kucoin(kc_sym) if kc_sym else 0.0
+        if wb is not None: prev_bin = wb
+        else: prev_bin = 0.0
+        if wk is not None: prev_kc = wk
+        else: prev_kc = 0.0
+
+        while not stop_flag.is_set():
+            try:
+                # If closing already in progress or positions cleared by bot, do not react
+                if closing_in_progress or positions.get(sym) is None:
+                    # Reset confirms and prev so we don't trigger on bot-initiated closes
+                    confirm_bin = 0
+                    confirm_kc = 0
+                    if positions.get(sym) is None:
+                        # stop watcher once positions cleared
+                        print(f"{datetime.now().isoformat()} Liquidation watcher stopping for {sym} because positions[sym] is None")
+                        break
+                    time.sleep(WATCHER_POLL_INTERVAL)
+                    continue
+
+                # fetch current signed amounts
+                cur_bin = _fetch_signed_binance(bin_sym)
+                cur_kc = _fetch_signed_kucoin(kc_sym) if kc_sym else 0.0
+
+                # If any fetch returned None (transient error), skip this round to avoid false triggers
+                if cur_bin is None or cur_kc is None:
+                    time.sleep(WATCHER_POLL_INTERVAL)
+                    continue
+
+                # detect binance went from non-zero to zero
+                if abs(prev_bin) > 0 and abs(cur_bin) == 0:
+                    confirm_bin += 1
+                else:
+                    confirm_bin = 0
+
+                # detect kucoin went from non-zero to zero
+                if abs(prev_kc) > 0 and abs(cur_kc) == 0:
+                    confirm_kc += 1
+                else:
+                    confirm_kc = 0
+
+                # Confirmed Binance-side unexpected zero -> treat as liquidation; close counterpart
+                if confirm_bin >= WATCHER_DETECT_CONFIRM:
+                    print(f"{datetime.now().isoformat()} Detected Binance side ZERO for {bin_sym} (confirmed). Triggering close_all_and_wait() to protect counterpart.")
+                    # call existing close_all_and_wait; it sets closing_in_progress internally
+                    try:
+                        close_all_and_wait()
+                    except Exception as e:
+                        print(f"{datetime.now().isoformat()} Error when closing after detected liquidation: {e}")
+                    # signal bot to stop main loop after closing
+                    global terminate_bot
+                    terminate_bot = True
+                    break
+
+                # Confirmed KuCoin-side unexpected zero -> treat as liquidation; close counterpart
+                if confirm_kc >= WATCHER_DETECT_CONFIRM:
+                    print(f"{datetime.now().isoformat()} Detected KuCoin side ZERO for {kc_sym} (confirmed). Triggering close_all_and_wait() to protect counterpart.")
+                    try:
+                        close_all_and_wait()
+                    except Exception as e:
+                        print(f"{datetime.now().isoformat()} Error when closing after detected liquidation: {e}")
+                    terminate_bot = True
+                    break
+
+                prev_bin = cur_bin
+                prev_kc = cur_kc
+                time.sleep(WATCHER_POLL_INTERVAL)
+            except Exception as e:
+                print(f"{datetime.now().isoformat()} Liquidation watcher exception for {sym}: {e}")
+                time.sleep(0.5)
+
+        # cleanup
+        _liquidation_watchers.pop(sym, None)
+        print(f"{datetime.now().isoformat()} Liquidation watcher EXIT for {sym}")
+
+    t = threading.Thread(target=monitor, daemon=True)
+    t.start()
+
+# -------------------- End of Integrated Watcher --------------------
+
+# --- NEW helper: robust executed price/time extractor --- (already above)
+
+# ----------------- MAIN LOOP (unchanged entry/exit logic but will start watcher when positions open) -----------------
 while True:
     try:
+        if terminate_bot:
+            print("Termination requested (liquidation protection triggered) — stopping bot.")
+            try:
+                close_all_and_wait()
+            except Exception:
+                pass
+            break
+
         bin_prices, kc_prices = get_prices()
         for i, sym in enumerate(SYMBOLS):
             bin_bid, bin_ask = bin_prices.get(sym, (None, None))
@@ -670,6 +825,13 @@ while True:
                             print(f" KuCoin executed: price={exec_price_kc} exec_time={exec_time_kc} slippage={sl_kc:.8f} latency_ms={lat_kc}")
                             print(f" Binance executed: price={exec_price_bin} exec_time={exec_time_bin} slippage={sl_bin:.8f} latency_ms={lat_bin}")
                             print(f" REAL Entry Spread: {real_entry_spread:.3f}% | PROFIT BASIS Spread: {final_entry_spread:.3f}%")
+
+                            # Start liquidation watcher for this symbol pair now that both sides are open
+                            try:
+                                _start_liquidation_watcher_for_symbol(sym, sym, kc_trade_sym)
+                            except Exception as e:
+                                print(f"{datetime.now().isoformat()} Failed to start liquidation watcher: {e}")
+
                         else:
                             print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} WARNING: Partial or failed execution in Case A. Closing positions if any.")
                             close_all_and_wait()
@@ -733,6 +895,13 @@ while True:
                             print(f" KuCoin executed: price={exec_price_kc} exec_time={exec_time_kc} slippage={sl_kc:.8f} latency_ms={lat_kc}")
                             print(f" Binance executed: price={exec_price_bin} exec_time={exec_time_bin} slippage={sl_bin:.8f} latency_ms={lat_bin}")
                             print(f" REAL Entry Spread: {real_entry_spread:.3f}% | PROFIT BASIS Spread: {final_entry_spread:.3f}%")
+
+                            # Start watcher now that both sides are open
+                            try:
+                                _start_liquidation_watcher_for_symbol(sym, sym, kc_trade_sym)
+                            except Exception as e:
+                                print(f"{datetime.now().isoformat()} Failed to start liquidation watcher: {e}")
+
                         else:
                             print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} WARNING: Partial or failed execution in Case B. Closing positions if any.")
                             close_all_and_wait()
