@@ -41,10 +41,10 @@ if missing:
     sys.exit(1)
 
 # ======================= TRADING CONFIG (from original trading bot) =======================
-NOTIONAL = float(os.getenv('NOTIONAL', "25.0"))
+NOTIONAL = float(os.getenv('NOTIONAL', "10.0"))
 LEVERAGE = int(os.getenv('LEVERAGE', "5"))
-ENTRY_SPREAD = float(os.getenv('ENTRY_SPREAD', "2.2"))
-PROFIT_TARGET = float(os.getenv('PROFIT_TARGET', "0.7"))
+ENTRY_SPREAD = float(os.getenv('ENTRY_SPREAD', "1.5"))
+PROFIT_TARGET = float(os.getenv('PROFIT_TARGET', "0.05"))
 MARGIN_BUFFER = float(os.getenv('MARGIN_BUFFER', "1.02"))
 
 # Liquidation watcher config
@@ -1646,3 +1646,4 @@ if __name__ == "__main__":
         logger.info("Interrupted by user, shutting down.")
     except Exception:
         logger.exception("Unhandled exception at top level")
+
