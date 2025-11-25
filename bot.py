@@ -18,7 +18,7 @@ SYMBOLS = ["AIAUSDT"]
 KUCOIN_SYMBOLS = ["AIAUSDTM"]
 NOTIONAL = 10.0
 LEVERAGE = 5
-ENTRY_SPREAD = 1.2
+ENTRY_SPREAD = 1.0
 PROFIT_TARGET = 0.05
 MARGIN_BUFFER = 1.02
 
@@ -197,55 +197,69 @@ def has_open_positions():
     except Exception:
         return True
 
-# --- ROBUST signed-qty extractor for debug & reliable closes (NEW) ---
+# --- ROBUST signed-qty extractor for debug & reliable closes (FIXED) ---
 def _get_signed_position_amount(pos):
     """
     Robustly extract a signed position amount from a ccxt position structure.
+    Prioritizes truly signed fields (positionAmt) over unsigned 'contracts' to preserve sign.
     Returns a float (positive for long, negative for short) or 0.0 if not found.
-    Keeps detailed debug logs to help pinpoint issues.
+    Extensive logs included to pinpoint parsing decisions.
     """
-    candidates = []
-    for fld in ('positionAmt', 'position_amount', 'amount', 'contracts', 'size'):
-        v = pos.get(fld)
-        if v not in (None, ''):
-            candidates.append((f'pos.{fld}', v))
     info = pos.get('info') or {}
-    for fld in ('positionAmt', 'position_amount', 'currentQty', 'current_qty', 'amount'):
+
+    # 1) Prefer signed fields from pos.info (these are authoritative for sign)
+    for fld in ('positionAmt', 'positionAmt', 'currentQty', 'currentQty', 'amount'):
         v = info.get(fld)
         if v not in (None, ''):
-            candidates.append((f'pos.info.{fld}', v))
-
-    for src, val in candidates:
-        try:
-            fv = float(val)
-            print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Parsed signed qty from {src}: {fv}")
-            return fv
-        except Exception:
             try:
-                fv = float(str(val).replace(',', ''))
-                print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Parsed signed qty (after cleanup) from {src}: {fv}")
+                fv = float(v)
+                print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Parsed signed qty from pos.info.{fld}: {fv}")
                 return fv
             except Exception:
-                print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Could not parse candidate {src} val={val}")
-                continue
+                try:
+                    fv = float(str(v).replace(',', ''))
+                    print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Parsed signed qty (cleanup) from pos.info.{fld}: {fv}")
+                    return fv
+                except Exception:
+                    print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Could not parse pos.info.{fld} val={v}")
 
+    # 2) Then check top-level signed fields (pos.positionAmt etc.)
+    for fld in ('positionAmt', 'amount', 'position_amount'):
+        v = pos.get(fld)
+        if v not in (None, ''):
+            try:
+                fv = float(v)
+                print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Parsed signed qty from pos.{fld}: {fv}")
+                return fv
+            except Exception:
+                try:
+                    fv = float(str(v).replace(',', ''))
+                    print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Parsed signed qty (cleanup) from pos.{fld}: {fv}")
+                    return fv
+                except Exception:
+                    print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Could not parse pos.{fld} val={v}")
+
+    # 3) Fallback: if no signed fields, attempt to infer sign using side fields and use unsigned magnitude (contracts/size)
     magnitude = 0.0
     for k in ('contracts', 'size', 'amount'):
-        if k in pos and pos.get(k) not in (None, ''):
+        v = pos.get(k)
+        if v not in (None, ''):
             try:
-                magnitude = float(pos.get(k))
+                magnitude = float(v)
                 print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Fallback magnitude from pos.{k}: {magnitude}")
                 break
             except Exception:
                 pass
-        if k in info and info.get(k) not in (None, ''):
+        vinfo = info.get(k)
+        if vinfo not in (None, ''):
             try:
-                magnitude = float(info.get(k))
+                magnitude = float(vinfo)
                 print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Fallback magnitude from pos.info.{k}: {magnitude}")
                 break
             except Exception:
                 pass
 
+    # Check side fields to infer sign
     side_field = ''
     for candidate in (pos.get('side'), info.get('side'), info.get('positionSide'), info.get('type')):
         if candidate:
@@ -258,7 +272,8 @@ def _get_signed_position_amount(pos):
     if side_field in ('long', 'buy'):
         return abs(magnitude)
 
-    print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Unable to determine signed qty precisely, returning magnitude: {magnitude}")
+    # Last resort: return unsigned magnitude (best-effort) but warn in logs
+    print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Unable to determine signed qty precisely, returning unsigned magnitude: {magnitude}")
     return float(magnitude or 0.0)
 
 # --- FIXED close_all_and_wait: robust Binance close + verbose logs (only this section changed) ---
@@ -768,4 +783,3 @@ while True:
     except Exception as e:
         print("ERROR:", e)
         time.sleep(0.5)
-
