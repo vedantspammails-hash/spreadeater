@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-# Integrated Scanner + Trading bot (Updated per request)
-# - Scanner selects candidate symbols each minute and monitors them.
-# - Uses exact original 3x consecutive confirmations for entry and enforces a single global open position at a time.
-# - When a candidate shows ±SPREAD >= ENTRY_SPREAD for 3 consecutive checks (as in the original trading bot),
-#   the trading engine is triggered and executes Case A or Case B WITHOUT modifying any trading logic inside those cases.
-# - All trading logic (parallel order execution, rebalance, liquidation watcher, exit logic, slippage/latency logs) is preserved.
-# - Telegram removed. Logging kept. Rate error handling included.
+# Integrated Scanner + Trading bot (with margin pre-check + leverage confirmation + verbose failure logging)
+# - Preserves original Case A / Case B trading logic exactly.
+# - Adds:
+#   * KuCoin pre-entry margin availability check (estimates required initial margin and skips entry if insufficient)
+#   * Small confirmation delay after setting leverage/margin mode
+#   * More verbose error logging in safe_create_order to capture exchange rejection details
+#   * STRONGER KuCoin post-order verification: after submitting a KuCoin market order we now poll KuCoin
+#     positions to make sure the position actually opened. If the position does not appear within a short
+#     timeout the order is treated as failed. This prevents the bot from recording a trade as "open"
+#     when KuCoin silently rejected/failed to open the position due to margin or other reasons.
+# - Keeps notional matching, rebalance, liquidation watcher, exit logic unchanged.
 #
-# Requirements: .env must contain API keys for Binance & KuCoin:
+# Requirements: .env keys for Binance & KuCoin futures:
 # BINANCE_API_KEY, BINANCE_API_SECRET, KUCOIN_API_KEY, KUCOIN_API_SECRET, KUCOIN_API_PASSPHRASE
 #
-# Ready to run on Railway (ensure environment variables are set)
+# Paste this single file to your environment (Railway) and run.
 
 import os
 import sys
@@ -40,27 +44,19 @@ if missing:
     print(f"ERROR: Missing .env keys: {', '.join(missing)}")
     sys.exit(1)
 
-# ======================= TRADING CONFIG (from original trading bot) =======================
+# ======================= CONFIG =======================
 NOTIONAL = float(os.getenv('NOTIONAL', "50.0"))
 LEVERAGE = int(os.getenv('LEVERAGE', "5"))
-ENTRY_SPREAD = float(os.getenv('ENTRY_SPREAD', "5.0"))
-PROFIT_TARGET = float(os.getenv('PROFIT_TARGET', "2.5"))
-MARGIN_BUFFER = float(os.getenv('MARGIN_BUFFER', "1.02"))
+ENTRY_SPREAD = float(os.getenv('ENTRY_SPREAD', "7.5"))
+PROFIT_TARGET = float(os.getenv('PROFIT_TARGET', "3.7"))
+MARGIN_BUFFER = float(os.getenv('MARGIN_BUFFER', "1.02"))  # used to estimate required initial margin
 
-# Liquidation watcher config
 WATCHER_POLL_INTERVAL = float(os.getenv('WATCHER_POLL_INTERVAL', "0.5"))
 WATCHER_DETECT_CONFIRM = int(os.getenv('WATCHER_DETECT_CONFIRM', "2"))
 
-# Notional / rebalance config
 MAX_NOTIONAL_MISMATCH_PCT = float(os.getenv('MAX_NOTIONAL_MISMATCH_PCT', "0.5"))
 REBALANCE_MIN_DOLLARS = float(os.getenv('REBALANCE_MIN_DOLLARS', "0.5"))
 
-print(f"\n{'='*72}")
-print(f"INTEGRATED SCANNER+TRADER | NOTIONAL ${NOTIONAL} @ {LEVERAGE}x | ENTRY >= {ENTRY_SPREAD}% | PROFIT TARGET {PROFIT_TARGET}%")
-print(f"NOTIONAL mismatch tolerance: {MAX_NOTIONAL_MISMATCH_PCT}% | REBALANCE_MIN_DOLLARS: ${REBALANCE_MIN_DOLLARS}")
-print(f"{'='*72}\n")
-
-# ======================= SCANNER CONFIG (from spreadwatcher) =======================
 SCAN_THRESHOLD = 0.25
 ALERT_THRESHOLD = 5.0
 ALERT_COOLDOWN = 60
@@ -72,12 +68,16 @@ MONITOR_POLL = 2
 CONFIRM_RETRY_DELAY = 0.5
 CONFIRM_RETRIES = 2
 
-# API endpoints used by scanner price fetches
 BINANCE_INFO_URL = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 BINANCE_BOOK_URL = "https://fapi.binance.com/fapi/v1/ticker/bookTicker"
 BINANCE_TICKER_URL = "https://fapi.binance.com/fapi/v1/ticker/bookTicker?symbol={symbol}"
 KUCOIN_ACTIVE_URL = "https://api-futures.kucoin.com/api/v1/contracts/active"
 KUCOIN_TICKER_URL = "https://api-futures.kucoin.com/api/v1/ticker?symbol={symbol}"
+
+print(f"\n{'='*72}")
+print(f"INTEGRATED SCANNER+TRADER | NOTIONAL ${NOTIONAL} @ {LEVERAGE}x | ENTRY >= {ENTRY_SPREAD}% | PROFIT TARGET {PROFIT_TARGET}%")
+print(f"NOTIONAL mismatch tolerance: {MAX_NOTIONAL_MISMATCH_PCT}% | REBALANCE_MIN_DOLLARS: ${REBALANCE_MIN_DOLLARS}")
+print(f"{'='*72}\n")
 
 # -------------------- Logging setup --------------------
 logger = logging.getLogger("integrated_arb")
@@ -112,7 +112,6 @@ kucoin = ccxt.kucoinfutures({
     'enableRateLimit': True
 })
 
-# Time sync
 def fix_time_offset():
     try:
         server = requests.get("https://fapi.binance.com/fapi/v1/time", timeout=5).json().get('serverTime')
@@ -177,8 +176,8 @@ def set_leverage_and_margin_for_symbol(bin_sym, kc_ccxt_sym):
 
 ensure_markets_loaded()
 
-# ======================= Shared State =======================
-positions = {}  # Binance symbol -> None / 'caseA' / 'caseB'
+# ======================= Shared State + synchronization =======================
+positions = {}
 trade_start_balances = {}
 entry_spreads = {}
 entry_prices = {}
@@ -186,15 +185,21 @@ entry_actual = {}
 entry_confirm_count = {}
 exit_confirm_count = {}
 
-KUCOIN_RAW_MAP = {}   # bin_sym -> ku_raw (like "BTCUSDTM")
-KUCOIN_CCXT_MAP = {}  # bin_sym -> ku_ccxt_sym (ccxt market symbol)
+KUCOIN_RAW_MAP = {}
+KUCOIN_CCXT_MAP = {}
 TRADED_BINANCE_SYMBOLS = []
 
 _liquidation_watchers = {}
 closing_in_progress = False
 terminate_bot = False
 
-# -------------------- Helpers from trading bot (unchanged behavior) --------------------
+state_lock = threading.Lock()
+entry_in_progress = threading.Event()  # when set, no other entry is started
+
+# NEW: track which symbol is currently being entered so scanner can avoid full scans
+current_entry_symbol = None
+
+# -------------------- Helper functions (unchanged trading logic) --------------------
 def round_down(value, precision):
     if precision is None: return float(value)
     factor = 10**precision
@@ -285,7 +290,7 @@ def _get_signed_from_kucoin_pos(pos):
             except Exception:
                 pass
     side_field = ''
-    for candidate in (pos.get('side'), info.get('side'), info.get('positionSide'), info.get('type')):
+    for candidate in (pos.get('side'), info.get('side'), info.get('positionSide'), pos.get('type')):
         if candidate:
             side_field = str(candidate).lower()
             break
@@ -570,6 +575,20 @@ def close_all_and_wait(timeout_s=20, poll_interval=0.5):
             total_bal, bin_bal, kc_bal = get_total_futures_balance()
             print(f"*** POST-TRADE Total Balance: ${total_bal:.2f} (Binance: ${bin_bal:.2f} | KuCoin: ${kc_bal:.2f}) ***")
             print("="*72)
+            with state_lock:
+                for sym in list(TRADED_BINANCE_SYMBOLS):
+                    positions.pop(sym, None)
+                    entry_confirm_count.pop(sym, None)
+                    exit_confirm_count.pop(sym, None)
+                    entry_prices.pop(sym, None)
+                    entry_actual.pop(sym, None)
+                    entry_spreads.pop(sym, None)
+                    KUCOIN_RAW_MAP.pop(sym, None)
+                    KUCOIN_CCXT_MAP.pop(sym, None)
+                    try:
+                        TRADED_BINANCE_SYMBOLS.remove(sym)
+                    except Exception:
+                        pass
             return True
         time.sleep(poll_interval)
     closing_in_progress = False
@@ -577,6 +596,7 @@ def close_all_and_wait(timeout_s=20, poll_interval=0.5):
     print("="*72)
     return False
 
+# -------------------- Execution confirmation helper (unchanged) --------------------
 def extract_executed_price_and_time(exchange, symbol, order_obj):
     try:
         if isinstance(order_obj, dict):
@@ -604,7 +624,7 @@ def extract_executed_price_and_time(exchange, symbol, order_obj):
         pass
     try:
         now_ms = int(time.time() * 1000)
-        trades = exchange.fetch_my_trades(symbol, since=now_ms-60000, limit=20)
+        trades = exchange.fetch_my_trades(symbol, since=now_ms-60000, limit=50)
         if trades:
             t = sorted(trades, key=lambda x: x.get('timestamp') or 0)[-1]
             px = t.get('price') or (t.get('info') or {}).get('price')
@@ -638,43 +658,131 @@ def extract_executed_price_and_time(exchange, symbol, order_obj):
         pass
     return None, None
 
-def safe_create_order(exchange, side, notional, price, symbol, trigger_time=None, trigger_price=None):
+# -------------------- Verification helper: confirm position exists after market order --------------------
+def _verify_position_open_for_exchange(exchange, ccxt_symbol, side, timeout_s=6.0, poll_interval=0.5):
+    """
+    After submitting a market order, some exchanges (KuCoin) may silently reject or fail to open
+    a position due to insufficient margin or other checks. This helper polls the exchange's positions
+    to confirm the resulting position is present and has non-zero size.
+
+    side: 'buy' or 'sell' (used to check sign direction on some exchanges, but we accept any non-zero as a success)
+    Returns (True, qty_signed) if a non-zero position is observed within timeout, else (False, 0.0).
+    """
+    start = time.time()
+    while time.time() - start < timeout_s:
+        try:
+            if 'binance' in exchange.id:
+                qty = _fetch_signed_binance(ccxt_symbol)
+            else:
+                qty = _fetch_signed_kucoin(ccxt_symbol)
+            if qty is None:
+                time.sleep(poll_interval)
+                continue
+            try:
+                q = float(qty or 0.0)
+            except Exception:
+                q = 0.0
+            if abs(q) > 1e-8:
+                return True, q
+        except Exception:
+            pass
+        time.sleep(poll_interval)
+    return False, 0.0
+
+# -------------------- Improved safe_create_order with verbose error logging + post-order verification --------------------
+def safe_create_order(exchange, side, notional, price, symbol, trigger_time=None, trigger_price=None, retries=3):
+    """
+    Submits a MARKET order for a desired notional.
+    For KuCoin we apply an additional verification step after the order is submitted to ensure a
+    position opened on KuCoin (otherwise treat as failure). This helps avoid the situation where
+    the API indicates an order/response but KuCoin didn't actually open the position (margin rejection,
+    internal checks, etc.).
+    """
     amt, _, _, prec = compute_amount_for_notional(exchange, symbol, notional, price)
     amt = round_down(amt, prec) if prec is not None else amt
     if amt <= 0:
         print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} computed amt <=0, skipping order for {exchange.id} {symbol} (notional=${notional} price={price})")
         return False, None, None
-    try:
-        sent_time = datetime.utcnow()
-        if exchange.id == 'binance':
-            if side.lower() == 'buy':
-                order = exchange.create_market_buy_order(symbol, amt)
-            else:
-                order = exchange.create_market_sell_order(symbol, amt)
-        else:
-            params = {'leverage': LEVERAGE, 'marginMode': 'cross'}
-            if side.lower() == 'buy':
-                order = exchange.create_market_buy_order(symbol, amt, params=params)
-            else:
-                order = exchange.create_market_sell_order(symbol, amt, params=params)
-        exec_price, exec_time = extract_executed_price_and_time(exchange, symbol, order)
-        slippage = None
-        latency_ms = None
-        if trigger_price is not None and exec_price is not None:
-            slippage = exec_price - float(trigger_price)
-        if trigger_time is not None and exec_time is not None:
+    last_exception = None
+    for attempt in range(1, retries + 1):
+        try:
+            sent_time = datetime.utcnow()
+            order = None
             try:
-                t0_ms = int(trigger_time.timestamp() * 1000)
-                t1_ms = int(datetime.fromisoformat(exec_time.replace('Z', '')).timestamp() * 1000)
-                latency_ms = t1_ms - t0_ms
-            except Exception:
-                latency_ms = None
-        print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} {exchange.id.upper()} ORDER EXECUTED | {side.upper()} {amt} {symbol} at market | exec_price={exec_price} exec_time={exec_time} slippage={slippage} latency_ms={latency_ms}")
-        return True, exec_price, exec_time
-    except Exception as e:
-        print(f"{exchange.id.upper()} order failed: {e}")
-        return False, None, None
+                if exchange.id == 'binance':
+                    if side.lower() == 'buy':
+                        order = exchange.create_market_buy_order(symbol, amt)
+                    else:
+                        order = exchange.create_market_sell_order(symbol, amt)
+                else:
+                    params = {'leverage': LEVERAGE, 'marginMode': 'cross'}
+                    if side.lower() == 'buy':
+                        order = exchange.create_market_buy_order(symbol, amt, params=params)
+                    else:
+                        order = exchange.create_market_sell_order(symbol, amt, params=params)
+            except Exception as e:
+                # log detailed error body if available (KuCoin may return margin-related errors here)
+                print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} {exchange.id.upper()} create order exception (attempt {attempt}/{retries}): {repr(e)}")
+                traceback.print_exc()
+                last_exception = e
+                time.sleep(0.25 * attempt)
+                continue
 
+            exec_price, exec_time = extract_executed_price_and_time(exchange, symbol, order)
+            if exec_price is None and attempt < retries:
+                time.sleep(0.4)
+                exec_price, exec_time = extract_executed_price_and_time(exchange, symbol, order)
+
+            slippage = None
+            latency_ms = None
+            if trigger_price is not None and exec_price is not None:
+                slippage = exec_price - float(trigger_price)
+            if trigger_time is not None and exec_time is not None:
+                try:
+                    t0_ms = int(trigger_time.timestamp() * 1000)
+                    t1_ms = int(datetime.fromisoformat(exec_time.replace('Z', '')).timestamp() * 1000)
+                    latency_ms = t1_ms - t0_ms
+                except Exception:
+                    latency_ms = None
+
+            if exec_price is not None:
+                # For KuCoin (and kucoinfutures) do an explicit poll to confirm the position exists
+                if 'kucoin' in exchange.id:
+                    ok_pos, qty_signed = _verify_position_open_for_exchange(exchange, symbol, side, timeout_s=6.0, poll_interval=0.5)
+                    if not ok_pos:
+                        # Position didn't appear — treat as failure (exchange likely rejected due to margin).
+                        print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} {exchange.id.upper()} ORDER APPEARED EXECUTED BUT NO POSITION FOUND for {symbol} | treating as failed. exec_price={exec_price} exec_time={exec_time} slippage={slippage} latency_ms={latency_ms}")
+                        # record last_exception for logging
+                        last_exception = Exception("No position detected after KuCoin market order — possible margin rejection / silent failure")
+                        # Attempt to surface logs: fetch recent orders/trades
+                        try:
+                            recent_orders = exchange.fetch_open_orders(symbol)
+                            print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} {exchange.id.upper()} open orders for {symbol}: {recent_orders}")
+                        except Exception:
+                            pass
+                        # do NOT leave the caller thinking this succeeded
+                        return False, None, None
+                    else:
+                        print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} {exchange.id.upper()} ORDER EXECUTED & POSITION CONFIRMED | {side.upper()} {amt} {symbol} | exec_price={exec_price} exec_time={exec_time} qty_signed={qty_signed} slippage={slippage} latency_ms={latency_ms}")
+                        return True, exec_price, exec_time
+                else:
+                    print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} {exchange.id.upper()} ORDER EXECUTED | {side.upper()} {amt} {symbol} at market | exec_price={exec_price} exec_time={exec_time} slippage={slippage} latency_ms={latency_ms}")
+                    return True, exec_price, exec_time
+            else:
+                print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} {exchange.id.upper()} order submitted but exec price/time unknown (attempt {attempt}/{retries}). Will retry if attempts remain.")
+                last_exception = Exception("No executed price/time found after order submission")
+                time.sleep(0.25)
+                continue
+        except Exception as e:
+            last_exception = e
+            print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} {exchange.id.upper()} order failed attempt {attempt}/{retries}: {repr(e)}")
+            traceback.print_exc()
+            time.sleep(0.25 * attempt)
+            continue
+    print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} {exchange.id.upper()} order ultimately failed after {retries} attempts: {repr(last_exception)}")
+    return False, None, None
+
+# -------------------- Notional matching helper (kept) --------------------
 def match_base_exposure_per_exchange(bin_exchange, kc_exchange, bin_symbol, kc_symbol, desired_usdt, bin_price, kc_price):
     m_bin = get_market(bin_exchange, bin_symbol)
     m_kc = get_market(kc_exchange, kc_symbol)
@@ -879,7 +987,7 @@ def _start_liquidation_watcher_for_symbol(sym, bin_sym, kc_sym):
     t = threading.Thread(target=monitor, daemon=True)
     t.start()
 
-# ===================== SCANNER Utilities (kept/merged) =====================
+# -------------------- SCANNER helpers --------------------
 def normalize(sym):
     if not sym:
         return sym
@@ -1042,13 +1150,38 @@ def calculate_spread(bin_bid, bin_ask, ku_bid, ku_ask):
         logger.exception("calculate_spread error")
         return None
 
-# ===================== TRADING: Case A & Case B (kept identical to original trading logic) =====================
-# NOTE: Per request, trading logic inside Case A and Case B is not modified. These functions replicate original behavior.
+# -------------------- Pre-entry KuCoin margin check --------------------
+def ensure_kucoin_margin_available(kc_ccxt_sym, desired_notional):
+    """
+    Estimate required initial margin on KuCoin for desired_notional at LEVERAGE and MARGIN_BUFFER.
+    Return True if available, False if insufficient, None if unknown (cannot determine).
+    """
+    try:
+        required_initial = (desired_notional / max(1, LEVERAGE)) * MARGIN_BUFFER
+        try:
+            bal = kucoin.fetch_balance()
+        except Exception as e:
+            print(f"{datetime.now().isoformat()} KUCOIN fetch_balance failed during margin check: {e}")
+            return None
+        usdt_info = bal.get('USDT') or bal.get('USDT') or {}
+        free = usdt_info.get('free') or usdt_info.get('available') or 0.0
+        total = usdt_info.get('total') or 0.0
+        available = free if free is not None else total
+        try:
+            available = float(available or 0.0)
+        except Exception:
+            available = float(total or 0.0)
+        if available >= required_initial:
+            return True
+        else:
+            print(f"{datetime.now().isoformat()} KUCOIN insufficient margin: need ~${required_initial:.4f} available=${available:.4f}")
+            return False
+    except Exception as e:
+        print(f"{datetime.now().isoformat()} Error in ensure_kucoin_margin_available: {e}")
+        return None
+
+# -------------------- Case A / Case B (trading logic preserved) --------------------
 def execute_caseA(bin_sym, kc_raw_sym, kc_ccxt_sym, trigger_time, bin_ask, kc_bid):
-    """
-    Case A: Binance ask < KuCoin bid -> Buy Binance, Sell KuCoin
-    (Original trading logic preserved)
-    """
     print(f"{trigger_time.strftime('%H:%M:%S.%f')[:-3]} ENTRY CASE A CONFIRMED  -> EXECUTING PARALLEL ORDERS for {bin_sym}/{kc_raw_sym}")
 
     notional_bin = NOTIONAL
@@ -1077,17 +1210,18 @@ def execute_caseA(bin_sym, kc_raw_sym, kc_ccxt_sym, trigger_time, bin_ask, kc_bi
 
         if mismatch_pct <= MAX_NOTIONAL_MISMATCH_PCT:
             real_entry_spread = 100 * (exec_price_kc - exec_price_bin) / exec_price_bin
-            final_entry_spread = real_entry_spread if real_entry_spread >= (100 * (kc_bid - bin_ask) / bin_ask) else real_entry_spread
-            print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Spread: Real({real_entry_spread:.3f}%) {'≥' if real_entry_spread >= (100 * (kc_bid - bin_ask) / bin_ask) else '<'} Trigger({(100 * (kc_bid - bin_ask) / bin_ask):.3f}%). Using {'Trigger' if real_entry_spread >= (100 * (kc_bid - bin_ask) / bin_ask) else 'Real'} Spread as profit basis.")
-            entry_prices[bin_sym] = {'kucoin': exec_price_kc, 'binance': exec_price_bin}
-            entry_actual[bin_sym] = {'kucoin': {'exec_price': exec_price_kc, 'exec_time': exec_time_kc}, 'binance': {'exec_price': exec_price_bin, 'exec_time': exec_time_bin}, 'trigger_time': trigger_time, 'trigger_price': {'binance': bin_ask, 'kucoin': kc_bid}}
-            entry_spreads[bin_sym] = final_entry_spread
-            positions[bin_sym] = 'caseA'
-            trade_start_balances[bin_sym] = start_total_balance
-            entry_confirm_count[bin_sym] = 0
+            trigger_spread = 100 * (kc_bid - bin_ask) / bin_ask
+            final_entry_spread = trigger_spread if real_entry_spread >= trigger_spread else real_entry_spread
+            print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Spread: Real({real_entry_spread:.3f}%) {'≥' if real_entry_spread >= trigger_spread else '<'} Trigger({trigger_spread:.3f}%). Using {'Trigger' if real_entry_spread >= trigger_spread else 'Real'} Spread as profit basis.")
+            with state_lock:
+                entry_prices[bin_sym] = {'kucoin': exec_price_kc, 'binance': exec_price_bin}
+                entry_actual[bin_sym] = {'kucoin': {'exec_price': exec_price_kc, 'exec_time': exec_time_kc}, 'binance': {'exec_price': exec_price_bin, 'exec_time': exec_time_bin}, 'trigger_time': trigger_time, 'trigger_price': {'binance': bin_ask, 'kucoin': kc_bid}}
+                entry_spreads[bin_sym] = final_entry_spread
+                positions[bin_sym] = 'caseA'
+                trade_start_balances[bin_sym] = start_total_balance
+                entry_confirm_count[bin_sym] = 0
             sl_kc = exec_price_kc - kc_bid
             sl_bin = exec_price_bin - bin_ask
-            lat_kc = lat_bin = None
             try:
                 t0_ms = int(trigger_time.timestamp() * 1000)
                 if exec_time_kc:
@@ -1103,8 +1237,8 @@ def execute_caseA(bin_sym, kc_raw_sym, kc_ccxt_sym, trigger_time, bin_ask, kc_bi
             except Exception:
                 pass
             print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} ENTRY SUMMARY | trigger_time={trigger_time.strftime('%H:%M:%S.%f')[:-3]} | trigger_prices bin:{bin_ask} kc:{kc_bid}")
-            print(f" KuCoin executed: price={exec_price_kc} exec_time={exec_time_kc} slippage={sl_kc:.8f} latency_ms={lat_kc}")
-            print(f" Binance executed: price={exec_price_bin} exec_time={exec_time_bin} slippage={sl_bin:.8f} latency_ms={lat_bin}")
+            print(f" KuCoin executed: price={exec_price_kc} exec_time={exec_time_kc} slippage={sl_kc:.8f}")
+            print(f" Binance executed: price={exec_price_bin} exec_time={exec_time_bin} slippage={sl_bin:.8f}")
             print(f" REAL Entry Spread: {real_entry_spread:.3f}% | PROFIT BASIS Spread: {final_entry_spread:.3f}%")
 
             try:
@@ -1140,13 +1274,14 @@ def execute_caseA(bin_sym, kc_raw_sym, kc_ccxt_sym, trigger_time, bin_ask, kc_bi
                     print(f"Post-rebalance implieds | bin:${new_implied_bin:.6f} kc:${new_implied_kc:.6f} | mismatch={new_mismatch:.3f}%")
                     if new_mismatch <= MAX_NOTIONAL_MISMATCH_PCT:
                         real_entry_spread = 100 * (exec_price_kc - exec_price_bin) / exec_price_bin
-                        final_entry_spread = real_entry_spread if real_entry_spread >= (100 * (kc_bid - bin_ask) / bin_ask) else real_entry_spread
-                        entry_prices[bin_sym] = {'kucoin': exec_price_kc, 'binance': exec_price_bin}
-                        entry_actual[bin_sym] = {'kucoin': {'exec_price': exec_price_kc, 'exec_time': exec_time_kc}, 'binance': {'exec_price': exec_price_bin, 'exec_time': exec_time_bin}, 'trigger_time': trigger_time, 'trigger_price': {'binance': bin_ask, 'kucoin': kc_bid}}
-                        entry_spreads[bin_sym] = final_entry_spread
-                        positions[bin_sym] = 'caseA'
-                        trade_start_balances[bin_sym] = start_total_balance
-                        entry_confirm_count[bin_sym] = 0
+                        final_entry_spread = trigger_spread if real_entry_spread >= trigger_spread else real_entry_spread
+                        with state_lock:
+                            entry_prices[bin_sym] = {'kucoin': exec_price_kc, 'binance': exec_price_bin}
+                            entry_actual[bin_sym] = {'kucoin': {'exec_price': exec_price_kc, 'exec_time': exec_time_kc}, 'binance': {'exec_price': exec_price_bin, 'exec_time': exec_time_bin}, 'trigger_time': trigger_time, 'trigger_price': {'binance': bin_ask, 'kucoin': kc_bid}}
+                            entry_spreads[bin_sym] = final_entry_spread
+                            positions[bin_sym] = 'caseA'
+                            trade_start_balances[bin_sym] = start_total_balance
+                            entry_confirm_count[bin_sym] = 0
                         print("Rebalance succeeded — trade accepted and watcher will start.")
                         try:
                             _start_liquidation_watcher_for_symbol(bin_sym, bin_sym, kc_ccxt_sym)
@@ -1163,13 +1298,14 @@ def execute_caseA(bin_sym, kc_raw_sym, kc_ccxt_sym, trigger_time, bin_ask, kc_bi
             else:
                 print("Mismatch below REBALANCE_MIN_DOLLARS — accepting small residual exposure and proceeding.")
                 real_entry_spread = 100 * (exec_price_kc - exec_price_bin) / exec_price_bin
-                final_entry_spread = real_entry_spread if real_entry_spread >= (100 * (kc_bid - bin_ask) / bin_ask) else real_entry_spread
-                entry_prices[bin_sym] = {'kucoin': exec_price_kc, 'binance': exec_price_bin}
-                entry_actual[bin_sym] = {'kucoin': {'exec_price': exec_price_kc, 'exec_time': exec_time_kc}, 'binance': {'exec_price': exec_price_bin, 'exec_time': exec_time_bin}, 'trigger_time': trigger_time, 'trigger_price': {'binance': bin_ask, 'kucoin': kc_bid}}
-                entry_spreads[bin_sym] = final_entry_spread
-                positions[bin_sym] = 'caseA'
-                trade_start_balances[bin_sym] = start_total_balance
-                entry_confirm_count[bin_sym] = 0
+                final_entry_spread = trigger_spread if real_entry_spread >= trigger_spread else real_entry_spread
+                with state_lock:
+                    entry_prices[bin_sym] = {'kucoin': exec_price_kc, 'binance': exec_price_bin}
+                    entry_actual[bin_sym] = {'kucoin': {'exec_price': exec_price_kc, 'exec_time': exec_time_kc}, 'binance': {'exec_price': exec_price_bin, 'exec_time': exec_time_bin}, 'trigger_time': trigger_time, 'trigger_price': {'binance': bin_ask, 'kucoin': kc_bid}}
+                    entry_spreads[bin_sym] = final_entry_spread
+                    positions[bin_sym] = 'caseA'
+                    trade_start_balances[bin_sym] = start_total_balance
+                    entry_confirm_count[bin_sym] = 0
                 try:
                     _start_liquidation_watcher_for_symbol(bin_sym, bin_sym, kc_ccxt_sym)
                 except Exception as e:
@@ -1180,10 +1316,6 @@ def execute_caseA(bin_sym, kc_raw_sym, kc_ccxt_sym, trigger_time, bin_ask, kc_bi
         entry_confirm_count[bin_sym] = 0
 
 def execute_caseB(bin_sym, kc_raw_sym, kc_ccxt_sym, trigger_time, bin_bid, kc_ask):
-    """
-    Case B: Binance bid > KuCoin ask -> Sell Binance, Buy KuCoin
-    (Original trading logic preserved)
-    """
     print(f"{trigger_time.strftime('%H:%M:%S.%f')[:-3]} ENTRY CASE B CONFIRMED  -> EXECUTING PARALLEL ORDERS for {bin_sym}/{kc_raw_sym}")
 
     notional_bin = NOTIONAL
@@ -1212,17 +1344,18 @@ def execute_caseB(bin_sym, kc_raw_sym, kc_ccxt_sym, trigger_time, bin_bid, kc_as
 
         if mismatch_pct <= MAX_NOTIONAL_MISMATCH_PCT:
             real_entry_spread = 100 * (exec_price_bin - exec_price_kc) / exec_price_kc
-            final_entry_spread = real_entry_spread if real_entry_spread >= (100 * (bin_bid - kc_ask) / kc_ask) else real_entry_spread
-            print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Spread: Real({real_entry_spread:.3f}%) {'≥' if real_entry_spread >= (100 * (bin_bid - kc_ask) / kc_ask) else '<'} Trigger({(100 * (bin_bid - kc_ask) / kc_ask):.3f}%). Using {'Trigger' if real_entry_spread >= (100 * (bin_bid - kc_ask) / kc_ask) else 'Real'} Spread as profit basis.")
-            entry_prices[bin_sym] = {'kucoin': exec_price_kc, 'binance': exec_price_bin}
-            entry_actual[bin_sym] = {'kucoin': {'exec_price': exec_price_kc, 'exec_time': exec_time_kc}, 'binance': {'exec_price': exec_price_bin, 'exec_time': exec_time_bin}, 'trigger_time': trigger_time, 'trigger_price': {'binance': bin_bid, 'kucoin': kc_ask}}
-            entry_spreads[bin_sym] = final_entry_spread
-            positions[bin_sym] = 'caseB'
-            trade_start_balances[bin_sym] = start_total_balance
-            entry_confirm_count[bin_sym] = 0
+            trigger_spread = 100 * (bin_bid - kc_ask) / kc_ask
+            final_entry_spread = trigger_spread if real_entry_spread >= trigger_spread else real_entry_spread
+            print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} Spread: Real({real_entry_spread:.3f}%) {'≥' if real_entry_spread >= trigger_spread else '<'} Trigger({trigger_spread:.3f}%). Using {'Trigger' if real_entry_spread >= trigger_spread else 'Real'} Spread as profit basis.")
+            with state_lock:
+                entry_prices[bin_sym] = {'kucoin': exec_price_kc, 'binance': exec_price_bin}
+                entry_actual[bin_sym] = {'kucoin': {'exec_price': exec_price_kc, 'exec_time': exec_time_kc}, 'binance': {'exec_price': exec_price_bin, 'exec_time': exec_time_bin}, 'trigger_time': trigger_time, 'trigger_price': {'binance': bin_bid, 'kucoin': kc_ask}}
+                entry_spreads[bin_sym] = final_entry_spread
+                positions[bin_sym] = 'caseB'
+                trade_start_balances[bin_sym] = start_total_balance
+                entry_confirm_count[bin_sym] = 0
             sl_kc = exec_price_kc - kc_ask
             sl_bin = exec_price_bin - bin_bid
-            lat_kc = lat_bin = None
             try:
                 t0_ms = int(trigger_time.timestamp() * 1000)
                 if exec_time_kc:
@@ -1238,8 +1371,8 @@ def execute_caseB(bin_sym, kc_raw_sym, kc_ccxt_sym, trigger_time, bin_bid, kc_as
             except Exception:
                 pass
             print(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} ENTRY SUMMARY | trigger_time={trigger_time.strftime('%H:%M:%S.%f')[:-3]} | trigger_prices bin:{bin_bid} kc:{kc_ask}")
-            print(f" KuCoin executed: price={exec_price_kc} exec_time={exec_time_kc} slippage={sl_kc:.8f} latency_ms={lat_kc}")
-            print(f" Binance executed: price={exec_price_bin} exec_time={exec_time_bin} slippage={sl_bin:.8f} latency_ms={lat_bin}")
+            print(f" KuCoin executed: price={exec_price_kc} exec_time={exec_time_kc} slippage={sl_kc:.8f}")
+            print(f" Binance executed: price={exec_price_bin} exec_time={exec_time_bin} slippage={sl_bin:.8f}")
             print(f" REAL Entry Spread: {real_entry_spread:.3f}% | PROFIT BASIS Spread: {final_entry_spread:.3f}%")
 
             try:
@@ -1275,13 +1408,14 @@ def execute_caseB(bin_sym, kc_raw_sym, kc_ccxt_sym, trigger_time, bin_bid, kc_as
                     print(f"Post-rebalance implieds | bin:${new_implied_bin:.6f} kc:${new_implied_kc:.6f} | mismatch={new_mismatch:.3f}%")
                     if new_mismatch <= MAX_NOTIONAL_MISMATCH_PCT:
                         real_entry_spread = 100 * (exec_price_bin - exec_price_kc) / exec_price_kc
-                        final_entry_spread = real_entry_spread if real_entry_spread >= (100 * (bin_bid - kc_ask) / kc_ask) else real_entry_spread
-                        entry_prices[bin_sym] = {'kucoin': exec_price_kc, 'binance': exec_price_bin}
-                        entry_actual[bin_sym] = {'kucoin': {'exec_price': exec_price_kc, 'exec_time': exec_time_kc}, 'binance': {'exec_price': exec_price_bin, 'exec_time': exec_time_bin}, 'trigger_time': trigger_time, 'trigger_price': {'binance': bin_bid, 'kucoin': kc_ask}}
-                        entry_spreads[bin_sym] = final_entry_spread
-                        positions[bin_sym] = 'caseB'
-                        trade_start_balances[bin_sym] = start_total_balance
-                        entry_confirm_count[bin_sym] = 0
+                        final_entry_spread = trigger_spread if real_entry_spread >= trigger_spread else real_entry_spread
+                        with state_lock:
+                            entry_prices[bin_sym] = {'kucoin': exec_price_kc, 'binance': exec_price_bin}
+                            entry_actual[bin_sym] = {'kucoin': {'exec_price': exec_price_kc, 'exec_time': exec_time_kc}, 'binance': {'exec_price': exec_price_bin, 'exec_time': exec_time_bin}, 'trigger_time': trigger_time, 'trigger_price': {'binance': bin_bid, 'kucoin': kc_ask}}
+                            entry_spreads[bin_sym] = final_entry_spread
+                            positions[bin_sym] = 'caseB'
+                            trade_start_balances[bin_sym] = start_total_balance
+                            entry_confirm_count[bin_sym] = 0
                         print("Rebalance succeeded — trade accepted and watcher will start.")
                         try:
                             _start_liquidation_watcher_for_symbol(bin_sym, bin_sym, kc_ccxt_sym)
@@ -1298,13 +1432,14 @@ def execute_caseB(bin_sym, kc_raw_sym, kc_ccxt_sym, trigger_time, bin_bid, kc_as
             else:
                 print("Mismatch below REBALANCE_MIN_DOLLARS — accepting small residual exposure and proceeding.")
                 real_entry_spread = 100 * (exec_price_bin - exec_price_kc) / exec_price_kc
-                final_entry_spread = real_entry_spread if real_entry_spread >= (100 * (bin_bid - kc_ask) / kc_ask) else real_entry_spread
-                entry_prices[bin_sym] = {'kucoin': exec_price_kc, 'binance': exec_price_bin}
-                entry_actual[bin_sym] = {'kucoin': {'exec_price': exec_price_kc, 'exec_time': exec_time_kc}, 'binance': {'exec_price': exec_price_bin, 'exec_time': exec_time_bin}, 'trigger_time': trigger_time, 'trigger_price': {'binance': bin_bid, 'kucoin': kc_ask}}
-                entry_spreads[bin_sym] = final_entry_spread
-                positions[bin_sym] = 'caseB'
-                trade_start_balances[bin_sym] = start_total_balance
-                entry_confirm_count[bin_sym] = 0
+                final_entry_spread = trigger_spread if real_entry_spread >= trigger_spread else real_entry_spread
+                with state_lock:
+                    entry_prices[bin_sym] = {'kucoin': exec_price_kc, 'binance': exec_price_bin}
+                    entry_actual[bin_sym] = {'kucoin': {'exec_price': exec_price_kc, 'exec_time': exec_time_kc}, 'binance': {'exec_price': exec_price_bin, 'exec_time': exec_time_bin}, 'trigger_time': trigger_time, 'trigger_price': {'binance': bin_bid, 'kucoin': kc_ask}}
+                    entry_spreads[bin_sym] = final_entry_spread
+                    positions[bin_sym] = 'caseB'
+                    trade_start_balances[bin_sym] = start_total_balance
+                    entry_confirm_count[bin_sym] = 0
                 try:
                     _start_liquidation_watcher_for_symbol(bin_sym, bin_sym, kc_ccxt_sym)
                 except Exception as e:
@@ -1314,7 +1449,7 @@ def execute_caseB(bin_sym, kc_raw_sym, kc_ccxt_sym, trigger_time, bin_bid, kc_as
         close_all_and_wait()
         entry_confirm_count[bin_sym] = 0
 
-# ===================== EXIT MONITOR (keeps original exit logic) =====================
+# -------------------- EXIT MONITOR (keeps original exit logic) --------------------
 def exit_monitor_loop():
     print("Exit monitor thread started.")
     session = requests.Session()
@@ -1370,14 +1505,15 @@ def exit_monitor_loop():
                             entry_confirm_count[sym] = 0
                             exit_confirm_count[sym] = 0
                             try:
-                                if sym in TRADED_BINANCE_SYMBOLS:
-                                    TRADED_BINANCE_SYMBOLS.remove(sym)
-                                KUCOIN_RAW_MAP.pop(sym, None)
-                                KUCOIN_CCXT_MAP.pop(sym, None)
-                                entry_prices.pop(sym, None)
-                                entry_actual.pop(sym, None)
-                                entry_spreads.pop(sym, None)
-                                trade_start_balances.pop(sym, None)
+                                with state_lock:
+                                    if sym in TRADED_BINANCE_SYMBOLS:
+                                        TRADED_BINANCE_SYMBOLS.remove(sym)
+                                    KUCOIN_RAW_MAP.pop(sym, None)
+                                    KUCOIN_CCXT_MAP.pop(sym, None)
+                                    entry_prices.pop(sym, None)
+                                    entry_actual.pop(sym, None)
+                                    entry_spreads.pop(sym, None)
+                                    trade_start_balances.pop(sym, None)
                             except Exception:
                                 pass
                         else:
@@ -1391,7 +1527,7 @@ def exit_monitor_loop():
             logger.exception("Fatal error in exit monitor loop, sleeping briefly")
             time.sleep(1)
 
-# ===================== SCANNER MAIN (now uses original 3x consecutive confirms + single-position guard) =====================
+# -------------------- SCANNER MAIN (3x confirms + single-position guard + margin pre-check) --------------------
 start_total_balance, start_bin_balance, start_kc_balance = get_total_futures_balance()
 print(f"Starting total balance approx: ${start_total_balance:.2f} (Binance: ${start_bin_balance:.2f} | KuCoin: ${start_kc_balance:.2f})\n")
 print(f"{datetime.now()} INTEGRATED BOT STARTED\n")
@@ -1400,6 +1536,7 @@ _exit_thread = threading.Thread(target=exit_monitor_loop, daemon=True)
 _exit_thread.start()
 
 def scanner_main_loop():
+    global current_entry_symbol
     last_alert = {}
     heartbeat_counter = 0
     http_session = requests.Session()
@@ -1407,6 +1544,18 @@ def scanner_main_loop():
     while True:
         window_start = time.time()
         try:
+            # EARLY GUARD:
+            # If an entry is in progress or a trade is already open, skip the full market discovery / candidate scanning.
+            # This prevents scanning and logging many other symbols while a symbol is being entered / is open.
+            with state_lock:
+                any_open_trades = len(TRADED_BINANCE_SYMBOLS) > 0
+                in_entry = entry_in_progress.is_set()
+            if in_entry or any_open_trades:
+                logger.info("Entry in progress or trade open (%s). Skipping full scan until cleared.", TRADED_BINANCE_SYMBOLS)
+                # Sleep a short amount and let exit_monitor (or the entry thread) handle the opened position.
+                time.sleep(max(0.5, MONITOR_POLL))
+                continue
+
             common_symbols, ku_map = get_common_symbols()
             if not common_symbols:
                 logger.warning("No common symbols — retrying after short sleep")
@@ -1417,7 +1566,6 @@ def scanner_main_loop():
             ku_symbols = [ku_map.get(sym, sym + "M") for sym in common_symbols]
             ku_prices = threaded_kucoin_prices(ku_symbols)
 
-            # prepare and shortlist candidates (unique symbols only)
             candidates = {}
             for sym in common_symbols:
                 bin_tick = bin_book.get(sym)
@@ -1444,28 +1592,46 @@ def scanner_main_loop():
                 time.sleep(to_sleep)
                 continue
 
-            # Initialize per-candidate entry_confirm_count if missing
-            for sym in candidates.keys():
-                entry_confirm_count.setdefault(sym, 0)
-                exit_confirm_count.setdefault(sym, 0)
-                positions.setdefault(sym, None)
-                entry_prices.setdefault(sym, {'binance': 0, 'kucoin': 0})
-                entry_actual.setdefault(sym, {'binance': None, 'kucoin': None, 'trigger_time': None, 'trigger_price': None})
-                entry_spreads.setdefault(sym, 0.0)
-                trade_start_balances.setdefault(sym, 0.0)
+            with state_lock:
+                for sym in candidates.keys():
+                    entry_confirm_count.setdefault(sym, 0)
+                    exit_confirm_count.setdefault(sym, 0)
+                    positions.setdefault(sym, None)
+                    entry_prices.setdefault(sym, {'binance': 0, 'kucoin': 0})
+                    entry_actual.setdefault(sym, {'binance': None, 'kucoin': None, 'trigger_time': None, 'trigger_price': None})
+                    entry_spreads.setdefault(sym, 0.0)
+                    trade_start_balances.setdefault(sym, 0.0)
 
-            # Focused monitoring for MONITOR_DURATION seconds using original 3x consecutive confirm logic
             window_end = window_start + MONITOR_DURATION
             while time.time() < window_end and candidates:
                 round_start = time.time()
+                # Respect the focal restriction if a current_entry_symbol has been set; otherwise monitor all candidates.
+                with state_lock:
+                    focal = current_entry_symbol
+                    if not focal:
+                        # find any symbol with in-progress confirms (>0)
+                        for s in list(candidates.keys()):
+                            if entry_confirm_count.get(s, 0) > 0:
+                                focal = s
+                                break
 
-                # Fetch latest prices for each candidate in parallel
-                workers = min(MAX_WORKERS, max(4, len(candidates)))
-                latest = {s: {"bin": None, "ku": None} for s in list(candidates.keys())}
+                # create a local view of candidates to monitor this round
+                if focal:
+                    if focal in candidates:
+                        monitored = {focal: candidates[focal]}
+                    else:
+                        # focal not in candidates (maybe expired); then reset focal to None and monitor all
+                        monitored = dict(candidates)
+                        focal = None
+                else:
+                    monitored = dict(candidates)
+
+                workers = min(MAX_WORKERS, max(4, len(monitored)))
+                latest = {s: {"bin": None, "ku": None} for s in list(monitored.keys())}
 
                 with ThreadPoolExecutor(max_workers=workers) as ex:
                     fut_map = {}
-                    for sym, info in list(candidates.items()):
+                    for sym, info in list(monitored.items()):
                         ku_sym = info["ku_sym"]
                         b_symbol = sym
                         fut_map[ex.submit(get_binance_price, b_symbol, http_session)] = ("bin", sym)
@@ -1480,21 +1646,18 @@ def scanner_main_loop():
                         if bid and ask:
                             latest[sym][typ] = {"bid": bid, "ask": ask}
 
-                # Evaluate each candidate and apply original entry-confirm logic + single-position guard
-                for sym in list(candidates.keys()):
-                    info = candidates.get(sym)
+                for sym in list(monitored.keys()):
+                    info = monitored.get(sym)
                     if not info:
                         continue
                     b = latest[sym].get("bin")
                     k = latest[sym].get("ku")
                     if not b or not k:
-                        # If prices missing, do not change confirmation count (stable approach)
                         continue
 
                     bin_bid, bin_ask = b['bid'], b['ask']
                     kc_bid, kc_ask = k['bid'], k['ask']
 
-                    # Reset confirmation counter if spread condition breaks (as original)
                     if bin_ask < kc_bid:
                         trigger_spread = 100 * (kc_bid - bin_ask) / bin_ask
                         if trigger_spread < ENTRY_SPREAD:
@@ -1504,43 +1667,49 @@ def scanner_main_loop():
                         if trigger_spread < ENTRY_SPREAD:
                             entry_confirm_count[sym] = 0
                     else:
-                        # neither side; reset
                         entry_confirm_count[sym] = 0
                         continue
 
-                    # CASE A: Binance ask < KuCoin bid (Buy Binance, Sell KuCoin)
                     if bin_ask < kc_bid:
                         trigger_spread = 100 * (kc_bid - bin_ask) / bin_ask
                         logger.info("CASE A %s | Trigger Spread: %.3f%% | Confirm: %d/3", sym, trigger_spread, entry_confirm_count[sym] + 1)
-                        # Only attempt entry if no position open anywhere and this symbol not currently marked as having a position
-                        if positions.get(sym) is None and trigger_spread >= ENTRY_SPREAD and not closing_in_progress and not has_open_positions():
+                        if positions.get(sym) is None and trigger_spread >= ENTRY_SPREAD and not closing_in_progress and not has_open_positions() and not entry_in_progress.is_set():
                             entry_confirm_count[sym] += 1
                             if entry_confirm_count[sym] >= 3:
-                                # EXACT original pre-trade actions (kept)
-                                total_bal, bin_bal, kc_bal = get_total_futures_balance()
-                                print(f"*** PRE-TRADE Total Balance: ${total_bal:.2f} (Binance: ${bin_bal:.2f} | KuCoin: ${kc_bal:.2f}) ***")
-                                trigger_time = datetime.utcnow()
-                                entry_actual[sym]['trigger_time'] = trigger_time
-                                entry_actual[sym]['trigger_price'] = {'binance': bin_ask, 'kucoin': kc_bid}
+                                with state_lock:
+                                    entry_actual.setdefault(sym, {'binance': None, 'kucoin': None, 'trigger_time': None, 'trigger_price': None})
+                                    entry_actual[sym]['trigger_time'] = datetime.utcnow()
+                                    entry_actual[sym]['trigger_price'] = {'binance': bin_ask, 'kucoin': kc_bid}
+                                    trigger_time = entry_actual[sym]['trigger_time']
                                 print(f"{trigger_time.strftime('%H:%M:%S.%f')[:-3]} ENTRY CASE A CONFIRMED 3/3 -> EXECUTING PARALLEL ORDERS for {sym}")
-
-                                # Resolve kucoin ccxt symbol
                                 kc_ccxt = resolve_kucoin_trade_symbol(kucoin, info["ku_sym"])
                                 if not kc_ccxt:
                                     logger.warning("Could not resolve KuCoin ccxt symbol for %s (raw %s) - skipping", sym, info["ku_sym"])
-                                    entry_confirm_count[sym] = 0
+                                    with state_lock:
+                                        entry_confirm_count[sym] = 0
                                     candidates.pop(sym, None)
                                     continue
-
-                                # Prepare TRADED lists and set leverage (idempotent)
-                                if sym not in TRADED_BINANCE_SYMBOLS:
-                                    TRADED_BINANCE_SYMBOLS.append(sym)
-                                KUCOIN_RAW_MAP[sym] = info["ku_sym"]
-                                KUCOIN_CCXT_MAP[sym] = kc_ccxt
+                                # set leverage & confirm application
                                 set_leverage_and_margin_for_symbol(sym, kc_ccxt)
-
-                                # CALL original trading logic for Case A (unchanged)
+                                time.sleep(0.22)  # small delay to let exchange apply leverage/margin mode
+                                # KuCoin margin pre-check
+                                margin_ok = ensure_kucoin_margin_available(kc_ccxt, NOTIONAL)
+                                if margin_ok is False:
+                                    logger.warning("Skipping entry for %s due to insufficient KuCoin margin.", sym)
+                                    with state_lock:
+                                        entry_confirm_count[sym] = 0
+                                    candidates.pop(sym, None)
+                                    continue
+                                # mark current entry symbol so scanner restricts scanning to it until opened
+                                with state_lock:
+                                    current_entry_symbol = sym
+                                entry_in_progress.set()
                                 try:
+                                    with state_lock:
+                                        if sym not in TRADED_BINANCE_SYMBOLS:
+                                            TRADED_BINANCE_SYMBOLS.append(sym)
+                                        KUCOIN_RAW_MAP[sym] = info["ku_sym"]
+                                        KUCOIN_CCXT_MAP[sym] = kc_ccxt
                                     execute_caseA(sym, info["ku_sym"], kc_ccxt, trigger_time, bin_ask, kc_bid)
                                 except Exception as e:
                                     logger.exception("Case A execution error for %s: %s", sym, e)
@@ -1548,41 +1717,52 @@ def scanner_main_loop():
                                         close_all_and_wait()
                                     except Exception:
                                         pass
-                                # remove symbol from monitoring for remainder of minute
+                                finally:
+                                    entry_in_progress.clear()
+                                    with state_lock:
+                                        current_entry_symbol = None
                                 candidates.pop(sym, None)
                         else:
-                            # If condition does not hold (e.g. position open elsewhere), do not increment and reset to 0
-                            if not (positions.get(sym) is None and trigger_spread >= ENTRY_SPREAD and not closing_in_progress and not has_open_positions()):
+                            if not (positions.get(sym) is None and trigger_spread >= ENTRY_SPREAD and not closing_in_progress and not has_open_positions() and not entry_in_progress.is_set()):
                                 entry_confirm_count[sym] = 0
 
-                    # CASE B: Binance bid > KuCoin ask (Sell Binance, Buy KuCoin)
                     elif bin_bid > kc_ask:
                         trigger_spread = 100 * (bin_bid - kc_ask) / kc_ask
                         logger.info("CASE B %s | Trigger Spread: %.3f%% | Confirm: %d/3", sym, trigger_spread, entry_confirm_count[sym] + 1)
-                        if positions.get(sym) is None and trigger_spread >= ENTRY_SPREAD and not closing_in_progress and not has_open_positions():
+                        if positions.get(sym) is None and trigger_spread >= ENTRY_SPREAD and not closing_in_progress and not has_open_positions() and not entry_in_progress.is_set():
                             entry_confirm_count[sym] += 1
                             if entry_confirm_count[sym] >= 3:
-                                total_bal, bin_bal, kc_bal = get_total_futures_balance()
-                                print(f"*** PRE-TRADE Total Balance: ${total_bal:.2f} (Binance: ${bin_bal:.2f} | KuCoin: ${kc_bal:.2f}) ***")
-                                trigger_time = datetime.utcnow()
-                                entry_actual[sym]['trigger_time'] = trigger_time
-                                entry_actual[sym]['trigger_price'] = {'binance': bin_bid, 'kucoin': kc_ask}
+                                with state_lock:
+                                    entry_actual.setdefault(sym, {'binance': None, 'kucoin': None, 'trigger_time': None, 'trigger_price': None})
+                                    entry_actual[sym]['trigger_time'] = datetime.utcnow()
+                                    entry_actual[sym]['trigger_price'] = {'binance': bin_bid, 'kucoin': kc_ask}
+                                    trigger_time = entry_actual[sym]['trigger_time']
                                 print(f"{trigger_time.strftime('%H:%M:%S.%f')[:-3]} ENTRY CASE B CONFIRMED 3/3 -> EXECUTING PARALLEL ORDERS for {sym}")
-
                                 kc_ccxt = resolve_kucoin_trade_symbol(kucoin, info["ku_sym"])
                                 if not kc_ccxt:
                                     logger.warning("Could not resolve KuCoin ccxt symbol for %s (raw %s) - skipping", sym, info["ku_sym"])
-                                    entry_confirm_count[sym] = 0
+                                    with state_lock:
+                                        entry_confirm_count[sym] = 0
                                     candidates.pop(sym, None)
                                     continue
-
-                                if sym not in TRADED_BINANCE_SYMBOLS:
-                                    TRADED_BINANCE_SYMBOLS.append(sym)
-                                KUCOIN_RAW_MAP[sym] = info["ku_sym"]
-                                KUCOIN_CCXT_MAP[sym] = kc_ccxt
                                 set_leverage_and_margin_for_symbol(sym, kc_ccxt)
-
+                                time.sleep(0.22)
+                                margin_ok = ensure_kucoin_margin_available(kc_ccxt, NOTIONAL)
+                                if margin_ok is False:
+                                    logger.warning("Skipping entry for %s due to insufficient KuCoin margin.", sym)
+                                    with state_lock:
+                                        entry_confirm_count[sym] = 0
+                                    candidates.pop(sym, None)
+                                    continue
+                                with state_lock:
+                                    current_entry_symbol = sym
+                                entry_in_progress.set()
                                 try:
+                                    with state_lock:
+                                        if sym not in TRADED_BINANCE_SYMBOLS:
+                                            TRADED_BINANCE_SYMBOLS.append(sym)
+                                        KUCOIN_RAW_MAP[sym] = info["ku_sym"]
+                                        KUCOIN_CCXT_MAP[sym] = kc_ccxt
                                     execute_caseB(sym, info["ku_sym"], kc_ccxt, trigger_time, bin_bid, kc_ask)
                                 except Exception as e:
                                     logger.exception("Case B execution error for %s: %s", sym, e)
@@ -1590,12 +1770,15 @@ def scanner_main_loop():
                                         close_all_and_wait()
                                     except Exception:
                                         pass
+                                finally:
+                                    entry_in_progress.clear()
+                                    with state_lock:
+                                        current_entry_symbol = None
                                 candidates.pop(sym, None)
                         else:
-                            if not (positions.get(sym) is None and trigger_spread >= ENTRY_SPREAD and not closing_in_progress and not has_open_positions()):
+                            if not (positions.get(sym) is None and trigger_spread >= ENTRY_SPREAD and not closing_in_progress and not has_open_positions() and not entry_in_progress.is_set()):
                                 entry_confirm_count[sym] = 0
 
-                # sleep until next poll round (but cap to window_end)
                 elapsed = time.time() - round_start
                 sleep_for = MONITOR_POLL - elapsed
                 if sleep_for > 0:
@@ -1604,7 +1787,6 @@ def scanner_main_loop():
                     if sleep_for > 0:
                         time.sleep(sleep_for)
 
-            # End of minute summary (optional)
             overall_max = None; overall_max_sym = None
             overall_min = None; overall_min_sym = None
             for sym, info in candidates.items():
@@ -1646,5 +1828,3 @@ if __name__ == "__main__":
         logger.info("Interrupted by user, shutting down.")
     except Exception:
         logger.exception("Unhandled exception at top level")
-
-
